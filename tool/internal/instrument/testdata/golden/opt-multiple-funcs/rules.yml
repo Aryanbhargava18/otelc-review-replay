@@ -1,0 +1,27 @@
+opt_good:
+  target: main
+  where:
+    func: OptGood
+  do:
+    - inject_hooks:
+        before: H5Before
+        path: testdata/golden/opt-multiple-funcs
+
+opt_bad:
+  target: main
+  where:
+    func: OptBad
+  do:
+    - inject_hooks:
+        before: H6Before
+        path: testdata/golden/opt-multiple-funcs
+
+opt_bad2:
+  target: main
+  where:
+    func: OptBad2
+  do:
+    - inject_hooks:
+        before: H7Before
+        after: H7After
+        path: testdata/golden/opt-multiple-funcs

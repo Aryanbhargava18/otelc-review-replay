@@ -1,0 +1,334 @@
+// Copyright The OpenTelemetry Authors
+// SPDX-License-Identifier: Apache-2.0
+
+package util
+
+import (
+	"bufio"
+	"os"
+	"strings"
+
+	"go.opentelemetry.io/otelc/tool/ex"
+)
+
+// isCompileTool checks if the tool path is the Go compile tool.
+// Checks for both Unix (/compile) and Windows (compile.exe) patterns for cross-platform compatibility.
+func isCompileTool(toolPath string) bool {
+	return strings.HasSuffix(toolPath, "/compile") || strings.HasSuffix(toolPath, "compile.exe")
+}
+
+// isLinkTool checks if the tool path is the Go link tool.
+// Checks for both Unix (/link) and Windows (link.exe) patterns for cross-platform compatibility.
+func isLinkTool(toolPath string) bool {
+	return strings.HasSuffix(toolPath, "/link") || strings.HasSuffix(toolPath, "link.exe")
+}
+
+// hasFlag checks if the args slice contains the specified flag.
+func hasFlag(args []string, flag string) bool {
+	for _, arg := range args {
+		if arg == flag || strings.HasPrefix(arg, flag+"=") {
+			return true
+		}
+	}
+	return false
+}
+
+// IsCompileCommandWithArgs checks if the args slice represents a compile command.
+// This is preferred over IsCompileCommand when you have the args as a slice,
+// as it correctly handles tool paths with spaces (common on Windows).
+func IsCompileCommandWithArgs(args []string) bool {
+	if len(args) == 0 {
+		return false
+	}
+
+	// Check if the tool path is the compile tool
+	if !isCompileTool(args[0]) {
+		return false
+	}
+
+	// Verify it has the expected compile command flags
+	requiredFlags := []string{"-o", "-p", "-buildid"}
+	for _, flag := range requiredFlags {
+		if !hasFlag(args, flag) {
+			return false
+		}
+	}
+
+	// PGO compile command is different, skip it
+	if hasFlag(args, "-pgoprofile") {
+		return false
+	}
+
+	return true
+}
+
+// IsLinkCommandWithArgs checks if the args slice represents a link command.
+func IsLinkCommandWithArgs(args []string) bool {
+	if len(args) == 0 {
+		return false
+	}
+
+	// Check if the tool path is the link tool
+	if !isLinkTool(args[0]) {
+		return false
+	}
+
+	// Verify it has the expected link command flags
+	requiredFlags := []string{"-o", "-buildid", "-importcfg"}
+	for _, flag := range requiredFlags {
+		if !hasFlag(args, flag) {
+			return false
+		}
+	}
+
+	return true
+}
+
+// isCgoCommand checks if the line is a cgo tool invocation with -objdir and -importpath flags.
+func IsCgoCommand(line string) bool {
+	return strings.Contains(line, "cgo") &&
+		strings.Contains(line, "-objdir") &&
+		strings.Contains(line, "-importpath") &&
+		!strings.Contains(line, "-dynimport")
+}
+
+// SplitGoflags splits a GOFLAGS value into tokens like the go command does
+// (https://cs.opensource.google/go/go/+/master:src/cmd/internal/quoted/quoted.go)
+//
+// space-separated, but a token starting with a quote runs to the matching close quote.
+// Quotes are kept so tokens re-join verbatim.
+func SplitGoflags(goflags string) []string {
+	isSpace := func(c byte) bool {
+		return c == ' ' || c == '\t' || c == '\n' || c == '\r'
+	}
+	var tokens []string
+	i := 0
+	for i < len(goflags) {
+		for i < len(goflags) && isSpace(goflags[i]) {
+			i++
+		}
+		if i >= len(goflags) {
+			break
+		}
+		start := i
+		if q := goflags[i]; q == '\'' || q == '"' {
+			i++
+			for i < len(goflags) && goflags[i] != q {
+				i++
+			}
+			if i < len(goflags) {
+				i++ // include the closing quote
+			}
+		} else {
+			for i < len(goflags) && !isSpace(goflags[i]) {
+				i++
+			}
+		}
+		tokens = append(tokens, goflags[start:i])
+	}
+	return tokens
+}
+
+// StripToolexecFromGoflags returns goflags without any -toolexec entry. In
+// drop-in mode the go commands otelc spawns would inherit the flag and
+// recursively re-invoke otelc; stripping it lets each command choose its
+// children's toolexec: none for setup discovery, an explicit CLI flag for
+// `otelc go build`, and nested version-only mode during instrumentation.
+func StripToolexecFromGoflags(goflags string) string {
+	tokens := SplitGoflags(goflags)
+	kept := make([]string, 0, len(tokens))
+	for _, token := range tokens {
+		unquoted := UnquoteGoflagsToken(token)
+		if unquoted == "-toolexec" || strings.HasPrefix(unquoted, "-toolexec=") {
+			continue
+		}
+		kept = append(kept, token)
+	}
+	return strings.Join(kept, " ")
+}
+
+// quotedTokenMinLen is the shortest GOFLAGS token that can hold a surrounding
+// quote pair: one opening quote and one closing quote.
+const quotedTokenMinLen = 2
+
+// UnquoteGoflagsToken removes one pair of surrounding matching quotes from a
+// GOFLAGS token, mirroring how the go command interprets it before acting on
+// the flag. A token without a matching surrounding quote pair is returned
+// unchanged. The token should already have been produced by SplitGoflags.
+func UnquoteGoflagsToken(token string) string {
+	if len(token) >= quotedTokenMinLen {
+		if q := token[0]; (q == '\'' || q == '"') && token[len(token)-1] == q {
+			return token[1 : len(token)-1]
+		}
+	}
+	return token
+}
+
+// QuoteGoflagsToken quotes a token for inclusion in a GOFLAGS value so that
+// cmd/internal/quoted.Split reads it back as a single field. Split only treats
+// a quote as opening a quoted field when it is the first byte of that field,
+// and performs no unescaping, so quotes further inside a token are literal and
+// need no quoting. A token is therefore quoted only when it contains
+// whitespace, or when it starts with a quote that would otherwise be read as an
+// opening delimiter; it is then wrapped in whichever of ' or " does not appear
+// in it. A token needing quotes that already contains both characters can't be
+// represented and returns an error.
+func QuoteGoflagsToken(token string) (string, error) {
+	if !strings.ContainsAny(token, " \t\n\r") &&
+		!strings.HasPrefix(token, "'") && !strings.HasPrefix(token, `"`) {
+		return token, nil
+	}
+	hasSingleQuote := strings.ContainsRune(token, '\'')
+	hasDoubleQuote := strings.ContainsRune(token, '"')
+	switch {
+	case !hasSingleQuote:
+		return "'" + token + "'", nil
+	case !hasDoubleQuote:
+		return "\"" + token + "\"", nil
+	default:
+		return "", ex.Newf("cannot quote token containing both single and double quotes: %q", token)
+	}
+}
+
+// BuildToolexecFlag returns the -toolexec flag that points the go command at
+// the given executable in toolexec mode. execPath is quoted when it needs to be,
+// because cmd/go splits the flag's value with cmd/internal/quoted.Split, so an
+// unquoted path containing a space would be read as a path plus extra arguments.
+func BuildToolexecFlag(execPath string) (string, error) {
+	quotedPath, err := QuoteGoflagsToken(execPath)
+	if err != nil {
+		return "", ex.Wrapf(err, "quoting otelc executable path for -toolexec")
+	}
+	return "-toolexec=" + quotedPath + " toolexec", nil
+}
+
+// FindFlagValue finds the value of a flag in the command line.
+func FindFlagValue(cmd []string, flag string) string {
+	flagWithValue := flag + "="
+	for i, v := range cmd {
+		if v == flag {
+			if i+1 < len(cmd) {
+				return cmd[i+1]
+			}
+			return ""
+		}
+		if suffix, ok := strings.CutPrefix(v, flagWithValue); ok {
+			return suffix
+		}
+	}
+	return ""
+}
+
+// SplitCompileCmds splits the command line by space, but keep the quoted part
+// as a whole. For example, "a b" c will be split into ["a b", "c"].
+func SplitCompileCmds(input string) []string {
+	var args []string
+	var inQuotes bool
+	var arg strings.Builder
+
+	for i := range len(input) {
+		c := input[i]
+
+		if c == '"' {
+			inQuotes = !inQuotes
+			continue
+		}
+
+		if c == ' ' && !inQuotes {
+			if arg.Len() > 0 {
+				args = append(args, arg.String())
+				arg.Reset()
+			}
+			continue
+		}
+
+		err := arg.WriteByte(c)
+		if err != nil {
+			ex.Fatal(err)
+		}
+	}
+
+	if arg.Len() > 0 {
+		args = append(args, arg.String())
+	}
+
+	// Handle unquoted Windows paths with spaces (e.g., from go build -x -n output)
+	// These look like: C:/Program Files/Go/pkg/tool/windows_amd64/compile.exe
+	// which gets incorrectly split into ["C:/Program", "Files/Go/pkg/tool/windows_amd64/compile.exe", ...]
+	args = mergeWindowsPathsWithSpaces(args)
+
+	// Fix the escaped backslashes on Windows
+	if IsWindows() {
+		for i, arg := range args {
+			args[i] = strings.ReplaceAll(arg, `\\`, `\`)
+		}
+	}
+	return args
+}
+
+const (
+	minWindowsDrivePrefixLength = 3
+	minWindowsPathMergeLength   = 2
+)
+
+// isWindowsDrivePrefix checks if arg looks like the start of a Windows path (e.g., "C:/Program")
+func isWindowsDrivePrefix(arg string) bool {
+	if len(arg) < minWindowsDrivePrefixLength {
+		return false
+	}
+	// Check for X:/ or X:\ pattern where X is a letter
+	firstChar := arg[0]
+	isLetter := (firstChar >= 'A' && firstChar <= 'Z') || (firstChar >= 'a' && firstChar <= 'z')
+	return isLetter && arg[1] == ':' && (arg[2] == '/' || arg[2] == '\\')
+}
+
+// mergeWindowsPathsWithSpaces merges split Windows paths that contain spaces.
+// For example, ["C:/Program", "Files/Go/pkg/tool/windows_amd64/compile.exe", "-o", ...]
+// becomes ["C:/Program Files/Go/pkg/tool/windows_amd64/compile.exe", "-o", ...]
+func mergeWindowsPathsWithSpaces(args []string) []string {
+	if len(args) < minWindowsPathMergeLength {
+		return args
+	}
+
+	// Only process if first arg looks like a Windows drive prefix without .exe
+	if !isWindowsDrivePrefix(args[0]) || strings.HasSuffix(strings.ToLower(args[0]), ".exe") {
+		return args
+	}
+
+	// Find where the executable path ends (look for .exe suffix)
+	mergeEnd := -1
+	for i := 1; i < len(args); i++ {
+		// Stop if we hit a flag
+		if strings.HasPrefix(args[i], "-") {
+			break
+		}
+		if strings.HasSuffix(strings.ToLower(args[i]), ".exe") {
+			mergeEnd = i
+			break
+		}
+	}
+
+	if mergeEnd == -1 {
+		return args
+	}
+
+	// Merge args[0] through args[mergeEnd] into a single path
+	merged := strings.Join(args[:mergeEnd+1], " ")
+	result := make([]string, 0, len(args)-mergeEnd)
+	result = append(result, merged)
+	result = append(result, args[mergeEnd+1:]...)
+	return result
+}
+
+func IsGoFile(path string) bool {
+	return strings.HasSuffix(strings.ToLower(path), ".go")
+}
+
+func NewFileScanner(file *os.File, size int) (*bufio.Scanner, error) {
+	if _, err := file.Seek(0, 0); err != nil {
+		return nil, ex.Wrapf(err, "failed to seek file")
+	}
+	scanner := bufio.NewScanner(file)
+	scanner.Buffer(make([]byte, 0, size), size)
+	return scanner, nil
+}

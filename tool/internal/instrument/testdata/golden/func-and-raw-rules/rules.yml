@@ -1,0 +1,17 @@
+hook_func:
+  target: main
+  where:
+    func: Func1
+  do:
+    - inject_hooks:
+        before: H1Before
+        after: H1After
+        path: testdata/golden/func-and-raw-rules
+
+add_raw_code:
+  target: main
+  where:
+    func: Func1
+  do:
+    - inject_code:
+        raw: "_ = 456"

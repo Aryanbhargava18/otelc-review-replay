@@ -1,0 +1,848 @@
+// Copyright The OpenTelemetry Authors
+// SPDX-License-Identifier: Apache-2.0
+
+package util
+
+import (
+	"os"
+	"path/filepath"
+	"reflect"
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func TestIsCompileCommand(t *testing.T) {
+	tests := []struct {
+		name     string
+		line     string
+		expected bool
+	}{
+		{
+			name:     "valid compile command on Unix",
+			line:     "/usr/local/go/pkg/tool/linux_amd64/compile -o /tmp/output.a -p main -buildid abc123",
+			expected: true,
+		},
+		{
+			name:     "valid compile command on Windows",
+			line:     "C:\\Go\\pkg\\tool\\windows_amd64\\compile.exe -o C:\\tmp\\output.a -p main -buildid abc123",
+			expected: true, // compile.exe is recognized on all platforms
+		},
+		{
+			name:     "valid compile command on Windows with spaces in path",
+			line:     `"C:\Program Files\Go\pkg\tool\windows_amd64\compile.exe" -o C:\tmp\output.a -p main -buildid abc123`,
+			expected: true, // quoted path with spaces should be parsed correctly
+		},
+		{
+			name:     "unquoted Windows path with spaces (go build -x -n output)",
+			line:     `C:/Program Files/Go/pkg/tool/windows_amd64/compile.exe -o C:/tmp/output.a -p main -buildid abc123`,
+			expected: true,
+		},
+		{
+			name:     "missing -o flag",
+			line:     "/usr/local/go/pkg/tool/linux_amd64/compile -p main -buildid abc123",
+			expected: false,
+		},
+		{
+			name:     "missing -p flag",
+			line:     "/usr/local/go/pkg/tool/linux_amd64/compile -o /tmp/output.a -buildid abc123",
+			expected: false,
+		},
+		{
+			name:     "missing -buildid flag",
+			line:     "/usr/local/go/pkg/tool/linux_amd64/compile -o /tmp/output.a -p main",
+			expected: false,
+		},
+		{
+			name:     "missing compile executable",
+			line:     "/usr/local/go/pkg/tool/linux_amd64/link -o /tmp/output.a -p main -buildid abc123",
+			expected: false,
+		},
+		{
+			name:     "PGO compile command should be excluded",
+			line:     "/usr/local/go/pkg/tool/linux_amd64/compile -o /tmp/output.a -p main -buildid abc123 -pgoprofile /tmp/default.pgo",
+			expected: false,
+		},
+		{
+			name:     "complete compile command with additional flags",
+			line:     "/usr/local/go/pkg/tool/linux_amd64/compile -o /tmp/output.a -trimpath -p main -buildid abc123 -goversion go1.21",
+			expected: true,
+		},
+		{
+			name:     "complete compile command with quoted paths",
+			line:     `/usr/local/go/pkg/tool/linux_amd64/compile -o "/tmp/my output.a" -p main -buildid abc123`,
+			expected: true,
+		},
+		{
+			name:     "empty line",
+			line:     "",
+			expected: false,
+		},
+		{
+			name:     "link command with compile in path",
+			line:     "/home/user/go/pkg/tool/linux_amd64/link -o /tmp/output.a -p main -buildid abc123",
+			expected: false,
+		},
+		{
+			name:     "partial match should fail",
+			line:     "compile -o output",
+			expected: false,
+		},
+		{
+			name:     "all required flags with importcfg",
+			line:     "/usr/local/go/pkg/tool/linux_amd64/compile -o /tmp/output.a -p main -buildid abc123 -importcfg /tmp/importcfg",
+			expected: true,
+		},
+		// Edge case: output path contains "compile" - should NOT match
+		{
+			name:     "link command with output path containing compile",
+			line:     "/usr/local/go/pkg/tool/linux_amd64/link -o /tmp/compile -buildid abc123 -importcfg /tmp/importcfg",
+			expected: false, // This is a link command, not compile
+		},
+		{
+			name:     "link command with output dir containing compile",
+			line:     "/usr/local/go/pkg/tool/linux_amd64/link -o /home/compile/output -buildid abc123 -importcfg /tmp/importcfg",
+			expected: false, // This is a link command, not compile
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := IsCompileCommandWithArgs(SplitCompileCmds(tt.line))
+			assert.Equal(t, tt.expected, result, "IsCompileCommand(%q) = %v, want %v", tt.line, result, tt.expected)
+		})
+	}
+}
+
+func TestIsCompileArgs(t *testing.T) {
+	tests := []struct {
+		name     string
+		args     []string
+		expected bool
+	}{
+		{
+			name: "valid compile args on Unix",
+			args: []string{
+				"/usr/local/go/pkg/tool/linux_amd64/compile",
+				"-o",
+				"/tmp/output.a",
+				"-p",
+				"main",
+				"-buildid",
+				"abc123",
+			},
+			expected: true,
+		},
+		{
+			name: "valid compile args on Windows",
+			args: []string{
+				`C:\Go\pkg\tool\windows_amd64\compile.exe`,
+				"-o",
+				`C:\tmp\output.a`,
+				"-p",
+				"main",
+				"-buildid",
+				"abc123",
+			},
+			expected: true,
+		},
+		{
+			name: "Windows path with spaces - unquoted args from toolexec",
+			args: []string{
+				`C:\Program Files\Go\pkg\tool\windows_amd64\compile.exe`,
+				"-o",
+				`C:\tmp\output.a`,
+				"-p",
+				"main",
+				"-buildid",
+				"abc123",
+			},
+			expected: true, // This is the key test case - args slice preserves the full path
+		},
+		{
+			name:     "empty args",
+			args:     []string{},
+			expected: false,
+		},
+		{
+			name:     "nil args",
+			args:     nil,
+			expected: false,
+		},
+		{
+			name: "missing -o flag",
+			args: []string{
+				"/usr/local/go/pkg/tool/linux_amd64/compile",
+				"-p",
+				"main",
+				"-buildid",
+				"abc123",
+			},
+			expected: false,
+		},
+		{
+			name: "missing -p flag",
+			args: []string{
+				"/usr/local/go/pkg/tool/linux_amd64/compile",
+				"-o",
+				"/tmp/output.a",
+				"-buildid",
+				"abc123",
+			},
+			expected: false,
+		},
+		{
+			name: "missing -buildid flag",
+			args: []string{
+				"/usr/local/go/pkg/tool/linux_amd64/compile",
+				"-o",
+				"/tmp/output.a",
+				"-p",
+				"main",
+			},
+			expected: false,
+		},
+		{
+			name: "PGO compile should be excluded",
+			args: []string{
+				"/usr/local/go/pkg/tool/linux_amd64/compile",
+				"-o",
+				"/tmp/output.a",
+				"-p",
+				"main",
+				"-buildid",
+				"abc123",
+				"-pgoprofile",
+				"/tmp/default.pgo",
+			},
+			expected: false,
+		},
+		{
+			name: "link command should not match",
+			args: []string{
+				"/usr/local/go/pkg/tool/linux_amd64/link",
+				"-o",
+				"/tmp/output",
+				"-buildid",
+				"abc123",
+				"-importcfg",
+				"/tmp/importcfg",
+			},
+			expected: false,
+		},
+		{
+			name: "flags with = syntax",
+			args: []string{
+				"/usr/local/go/pkg/tool/linux_amd64/compile",
+				"-o=/tmp/output.a",
+				"-p=main",
+				"-buildid=abc123",
+			},
+			expected: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := IsCompileCommandWithArgs(tt.args)
+			assert.Equal(
+				t,
+				tt.expected,
+				result,
+				"IsCompileCommandWithArgs(%v) = %v, want %v",
+				tt.args,
+				result,
+				tt.expected,
+			)
+		})
+	}
+}
+
+func TestIsLinkArgs(t *testing.T) {
+	tests := []struct {
+		name     string
+		args     []string
+		expected bool
+	}{
+		{
+			name: "valid link args on Unix",
+			args: []string{
+				"/usr/local/go/pkg/tool/linux_amd64/link",
+				"-o",
+				"/tmp/output",
+				"-buildid",
+				"abc123",
+				"-importcfg",
+				"/tmp/importcfg.link",
+			},
+			expected: true,
+		},
+		{
+			name: "valid link args on Windows",
+			args: []string{
+				`C:\Go\pkg\tool\windows_amd64\link.exe`,
+				"-o",
+				`C:\tmp\output.exe`,
+				"-buildid",
+				"abc123",
+				"-importcfg",
+				`C:\tmp\importcfg.link`,
+			},
+			expected: true,
+		},
+		{
+			name: "Windows path with spaces - unquoted args from toolexec",
+			args: []string{
+				`C:\Program Files\Go\pkg\tool\windows_amd64\link.exe`,
+				"-o",
+				`C:\tmp\output.exe`,
+				"-buildid",
+				"abc123",
+				"-importcfg",
+				`C:\tmp\importcfg.link`,
+			},
+			expected: true, // This is the key test case - args slice preserves the full path
+		},
+		{
+			name:     "empty args",
+			args:     []string{},
+			expected: false,
+		},
+		{
+			name:     "nil args",
+			args:     nil,
+			expected: false,
+		},
+		{
+			name: "missing -o flag",
+			args: []string{
+				"/usr/local/go/pkg/tool/linux_amd64/link",
+				"-buildid",
+				"abc123",
+				"-importcfg",
+				"/tmp/importcfg.link",
+			},
+			expected: false,
+		},
+		{
+			name: "missing -buildid flag",
+			args: []string{
+				"/usr/local/go/pkg/tool/linux_amd64/link",
+				"-o",
+				"/tmp/output",
+				"-importcfg",
+				"/tmp/importcfg.link",
+			},
+			expected: false,
+		},
+		{
+			name: "missing -importcfg flag",
+			args: []string{
+				"/usr/local/go/pkg/tool/linux_amd64/link",
+				"-o",
+				"/tmp/output",
+				"-buildid",
+				"abc123",
+			},
+			expected: false,
+		},
+		{
+			name: "compile command should not match",
+			args: []string{
+				"/usr/local/go/pkg/tool/linux_amd64/compile",
+				"-o",
+				"/tmp/output.a",
+				"-p",
+				"main",
+				"-buildid",
+				"abc123",
+				"-importcfg",
+				"/tmp/importcfg",
+			},
+			expected: false,
+		},
+		{
+			name: "flags with = syntax",
+			args: []string{
+				"/usr/local/go/pkg/tool/linux_amd64/link",
+				"-o=/tmp/output",
+				"-buildid=abc123",
+				"-importcfg=/tmp/importcfg.link",
+			},
+			expected: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := IsLinkCommandWithArgs(tt.args)
+			assert.Equal(
+				t,
+				tt.expected,
+				result,
+				"IsLinkCommandWithArgs(%v) = %v, want %v",
+				tt.args,
+				result,
+				tt.expected,
+			)
+		})
+	}
+}
+
+func TestIsCgoCommand(t *testing.T) {
+	tests := []struct {
+		name     string
+		line     string
+		expected bool
+	}{
+		{
+			name:     "valid cgo command",
+			line:     "/usr/local/go/pkg/tool/linux_amd64/cgo -objdir /tmp/cgo -importpath github.com/example/pkg",
+			expected: true,
+		},
+		{
+			name:     "valid cgo command with additional flags",
+			line:     "cgo -objdir /tmp/cgo -importpath github.com/example/pkg -srcdir /home/user/project",
+			expected: true,
+		},
+		{
+			name:     "cgo command with quoted paths",
+			line:     `cgo -objdir "/tmp/my cgo" -importpath github.com/example/pkg`,
+			expected: true,
+		},
+		{
+			name:     "missing cgo executable",
+			line:     "/usr/local/go/pkg/tool/linux_amd64/link -objdir /tmp/obj -importpath github.com/example/pkg",
+			expected: false,
+		},
+		{
+			name:     "missing -objdir flag",
+			line:     "cgo -importpath github.com/example/pkg",
+			expected: false,
+		},
+		{
+			name:     "missing -importpath flag",
+			line:     "cgo -objdir /tmp/cgo",
+			expected: false,
+		},
+		{
+			name:     "cgo command with -dynimport should be excluded",
+			line:     "cgo -objdir /tmp/cgo -importpath github.com/example/pkg -dynimport",
+			expected: false,
+		},
+		{
+			name:     "cgo command with -dynimport flag with value",
+			line:     "cgo -objdir /tmp/cgo -importpath github.com/example/pkg -dynimport /tmp/output",
+			expected: false,
+		},
+		{
+			name:     "empty line",
+			line:     "",
+			expected: false,
+		},
+		{
+			name:     "cgo in path but missing flags",
+			line:     "/home/cgo/project/build",
+			expected: false,
+		},
+		{
+			name:     "partial match with only cgo and objdir",
+			line:     "cgo -objdir /tmp/cgo",
+			expected: false,
+		},
+		{
+			name:     "partial match with only cgo and importpath",
+			line:     "cgo -importpath github.com/example/pkg",
+			expected: false,
+		},
+		{
+			name:     "complete cgo command on Windows",
+			line:     "C:\\Go\\pkg\\tool\\windows_amd64\\cgo.exe -objdir C:\\tmp\\cgo -importpath github.com/example/pkg",
+			expected: true,
+		},
+		{
+			name:     "cgo with all common flags",
+			line:     "cgo -objdir /tmp/cgo -importpath github.com/example/pkg -exportheader /tmp/export.h -gccgo -gccgoprefix prefix",
+			expected: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := IsCgoCommand(tt.line)
+			assert.Equal(t, tt.expected, result, "IsCgoCommand(%q) = %v, want %v", tt.line, result, tt.expected)
+		})
+	}
+}
+
+func TestFindFlagValue(t *testing.T) {
+	tests := []struct {
+		name     string
+		cmd      []string
+		flag     string
+		expected string
+	}{
+		{
+			name:     "flag found with value",
+			cmd:      []string{"compile", "-o", "output.a", "-p", "main"},
+			flag:     "-o",
+			expected: "output.a",
+		},
+		{
+			name:     "flag not found",
+			cmd:      []string{"compile", "-o", "output.a", "-p", "main"},
+			flag:     "-buildid",
+			expected: "",
+		},
+		{
+			name:     "empty command slice",
+			cmd:      []string{},
+			flag:     "-o",
+			expected: "",
+		},
+		{
+			name:     "flag with path containing spaces",
+			cmd:      []string{"compile", "-o", "/path/to/my output.a", "-p", "main"},
+			flag:     "-o",
+			expected: "/path/to/my output.a",
+		},
+		{
+			name:     "multiple occurrences returns first",
+			cmd:      []string{"compile", "-flag", "first", "-flag", "second"},
+			flag:     "-flag",
+			expected: "first",
+		},
+		{
+			name:     "flag in equals form",
+			cmd:      []string{"compile", "-o=output.a", "-p", "main"},
+			flag:     "-o",
+			expected: "output.a",
+		},
+		{
+			name:     "flag equals form without value",
+			cmd:      []string{"compile", "-o=", "-p", "main"},
+			flag:     "-o",
+			expected: "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := FindFlagValue(tt.cmd, tt.flag)
+			assert.Equal(t, tt.expected, result,
+				"FindFlagValue(%v, %q) = %q, want %q", tt.cmd, tt.flag, result, tt.expected)
+		})
+	}
+}
+
+func TestIsGoFile(t *testing.T) {
+	tests := []struct {
+		name     string
+		path     string
+		expected bool
+	}{
+		{
+			name:     "simple go file",
+			path:     "main.go",
+			expected: true,
+		},
+		{
+			name:     "go file with path",
+			path:     "/usr/local/src/project/main.go",
+			expected: true,
+		},
+		{
+			name:     "uppercase GO extension",
+			path:     "main.GO",
+			expected: true,
+		},
+		{
+			name:     "non-go file",
+			path:     "main.c",
+			expected: false,
+		},
+		{
+			name:     "go in filename but not extension",
+			path:     "golang.c",
+			expected: false,
+		},
+		{
+			name:     "empty string",
+			path:     "",
+			expected: false,
+		},
+		{
+			name:     "test go file",
+			path:     "main_test.go",
+			expected: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := IsGoFile(tt.path)
+			assert.Equal(t, tt.expected, result, "IsGoFile(%q) = %v, want %v", tt.path, result, tt.expected)
+		})
+	}
+}
+
+func TestSplitCompileCmds(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    string
+		isWin    bool
+		expected []string
+	}{
+		{
+			name:     "basic split with quotes",
+			input:    `"a b" c`,
+			isWin:    false,
+			expected: []string{"a b", "c"},
+		},
+		{
+			name:     "quoted and unquoted mix",
+			input:    `-o "my file.o" -p main`,
+			isWin:    false,
+			expected: []string{"-o", "my file.o", "-p", "main"},
+		},
+		{
+			name:     "no quotes",
+			input:    `-o file.o -p main`,
+			isWin:    false,
+			expected: []string{"-o", "file.o", "-p", "main"},
+		},
+		{
+			name:     "Windows path unescaping",
+			input:    "-o \"C:\\\\path\\\\to\\\\file.o\"",
+			isWin:    true,
+			expected: []string{"-o", `C:\path\to\file.o`},
+		},
+		{
+			name:     "Trailing space",
+			input:    `-o file.o `,
+			isWin:    false,
+			expected: []string{"-o", "file.o"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Skip Windows-only tests if not on Windows
+			if tt.isWin && !IsWindows() {
+				t.Skip("Skipping Windows-specific test on non-Windows system")
+			}
+
+			// Skip non-Windows-only tests if on Windows
+			if !tt.isWin && IsWindows() {
+				t.Skip("Skipping non-Windows-specific test on Windows system")
+			}
+
+			actual := SplitCompileCmds(tt.input)
+			if !reflect.DeepEqual(actual, tt.expected) {
+				t.Errorf("Expected: %#v, got: %#v", tt.expected, actual)
+			}
+		})
+	}
+}
+
+func TestUnquoteGoflagsToken(t *testing.T) {
+	tests := []struct {
+		name  string
+		token string
+		want  string
+	}{
+		{name: "unquoted token unchanged", token: "-mod=mod", want: "-mod=mod"},
+		{name: "single-quoted token stripped", token: "'-mod=readonly'", want: "-mod=readonly"},
+		{name: "double-quoted token stripped", token: `"-mod=readonly"`, want: "-mod=readonly"},
+		{name: "mismatched pair unchanged", token: `'-mod=readonly"`, want: `'-mod=readonly"`},
+		{name: "double layer strips one layer", token: `"'-mod=readonly'"`, want: "'-mod=readonly'"},
+		{name: "one-character token unchanged", token: "'", want: "'"},
+		{name: "empty token unchanged", token: "", want: ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, UnquoteGoflagsToken(tt.token))
+		})
+	}
+}
+
+func TestQuoteGoflagsToken(t *testing.T) {
+	tests := []struct {
+		name    string
+		token   string
+		want    string
+		wantErr bool
+	}{
+		{name: "plain token unquoted", token: "-race", want: "-race"},
+		{name: "token with space uses single quotes", token: "foo bar", want: "'foo bar'"},
+		{name: "token with tab uses single quotes", token: "foo\tbar", want: "'foo\tbar'"},
+		// quoted.Split only opens a quoted field on a leading quote, so an
+		// interior quote is literal and must be left alone. Quoting it anyway
+		// would drag a second quote character into the token and break the
+		// outer quoting applied for GOFLAGS.
+		{name: "interior single quote stays unquoted", token: "it's", want: "it's"},
+		{name: "interior double quote stays unquoted", token: `say"hi"`, want: `say"hi"`},
+		{name: "interior quotes of both kinds stay unquoted", token: `a'b"c`, want: `a'b"c`},
+		// A leading quote would be read as an opening delimiter, so it does
+		// need wrapping even without whitespace.
+		{name: "leading single quote uses double quotes", token: "'foo", want: `"'foo"`},
+		{name: "leading double quote uses single quotes", token: `"foo`, want: `'"foo'`},
+		{name: "token with double quote uses single quotes", token: `say "hi"`, want: `'say "hi"'`},
+		{name: "token with both quotes errors", token: `a ' " b`, wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := QuoteGoflagsToken(tt.token)
+			if tt.wantErr {
+				require.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
+func TestBuildToolexecFlag(t *testing.T) {
+	tests := []struct {
+		name     string
+		execPath string
+		want     string
+		wantErr  bool
+	}{
+		{
+			name:     "path without spaces stays unquoted",
+			execPath: "/usr/local/bin/otelc",
+			want:     "-toolexec=/usr/local/bin/otelc toolexec",
+		},
+		{
+			name:     "path with spaces is single quoted",
+			execPath: `C:\Program Files\otelc\otelc.exe`,
+			want:     `-toolexec='C:\Program Files\otelc\otelc.exe' toolexec`,
+		},
+		{
+			name:     "path with a single quote falls back to double quotes",
+			execPath: "/home/it's me/otelc",
+			want:     `-toolexec="/home/it's me/otelc" toolexec`,
+		},
+		{
+			// Regression: a quote with no whitespace needs no quoting at all.
+			// Wrapping it used to leave both quote characters in the flag, which
+			// made the outer GOFLAGS quoting in EnableNestedToolexec fail for a
+			// path that is otherwise perfectly usable.
+			name:     "path with a quote but no space stays unquoted",
+			execPath: "/tmp/it's/otelc",
+			want:     "-toolexec=/tmp/it's/otelc toolexec",
+		},
+		{
+			name:     "path with both quote characters errors",
+			execPath: `/home/it's "me"/otelc`,
+			wantErr:  true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := BuildToolexecFlag(tt.execPath)
+			if tt.wantErr {
+				require.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
+// A -toolexec entry built by BuildToolexecFlag carries its own inner quotes
+// once the executable path has a space, so stripping has to see past them.
+func TestStripToolexecFromGoflagsWithNestedQuotes(t *testing.T) {
+	inner, err := BuildToolexecFlag(`C:\Program Files\otelc\otelc.exe`)
+	require.NoError(t, err)
+	token, err := QuoteGoflagsToken(inner)
+	require.NoError(t, err)
+
+	assert.Empty(t, StripToolexecFromGoflags(token))
+	assert.Equal(t, "-mod=mod", StripToolexecFromGoflags("-mod=mod "+token))
+	assert.Equal(t, "-mod=mod", StripToolexecFromGoflags(token+" -mod=mod"))
+}
+
+func TestNewFileScanner(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "lines.txt")
+	require.NoError(t, os.WriteFile(path, []byte("line1\nline2\nline3\n"), 0o644))
+
+	f, err := os.Open(path)
+	require.NoError(t, err)
+	defer f.Close()
+
+	// Advance the offset first; NewFileScanner must seek back to the start.
+	_, err = f.Seek(3, 0)
+	require.NoError(t, err)
+
+	scanner, err := NewFileScanner(f, 4096)
+	require.NoError(t, err)
+
+	var lines []string
+	for scanner.Scan() {
+		lines = append(lines, scanner.Text())
+	}
+	require.NoError(t, scanner.Err())
+	assert.Equal(t, []string{"line1", "line2", "line3"}, lines)
+}
+
+func TestStripToolexecFromGoflags(t *testing.T) {
+	tests := []struct {
+		name     string
+		goflags  string
+		expected string
+	}{
+		{
+			name:     "empty",
+			goflags:  "",
+			expected: "",
+		},
+		{
+			name:     "no toolexec flag",
+			goflags:  "-mod=mod -race",
+			expected: "-mod=mod -race",
+		},
+		{
+			name:     "bare toolexec flag",
+			goflags:  "-toolexec=otelc",
+			expected: "",
+		},
+		{
+			name:     "single-quoted toolexec flag with space",
+			goflags:  "'-toolexec=otelc toolexec'",
+			expected: "",
+		},
+		{
+			name:     "double-quoted toolexec flag with space",
+			goflags:  `"-toolexec=otelc toolexec"`,
+			expected: "",
+		},
+		{
+			name:     "toolexec flag between other flags",
+			goflags:  "-mod=mod '-toolexec=otelc toolexec' -race",
+			expected: "-mod=mod -race",
+		},
+		{
+			name:     "other quoted flags are preserved verbatim",
+			goflags:  "'-tags=a b' -toolexec=otelc",
+			expected: "'-tags=a b'",
+		},
+		{
+			name:     "extra whitespace between flags",
+			goflags:  "  -mod=mod   -toolexec=otelc  ",
+			expected: "-mod=mod",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := StripToolexecFromGoflags(tt.goflags); got != tt.expected {
+				t.Errorf("StripToolexecFromGoflags(%q) = %q, want %q", tt.goflags, got, tt.expected)
+			}
+		})
+	}
+}

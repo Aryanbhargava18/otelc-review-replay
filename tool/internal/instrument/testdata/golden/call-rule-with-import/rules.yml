@@ -1,0 +1,9 @@
+wrap_sizeof_with_strings:
+  target: main
+  where:
+    function_call: unsafe.Sizeof
+  do:
+    - wrap_call:
+        replace: "(func() uintptr { fmt.Println(\"Wrapped!\"); return {{ . }} })()"
+  imports:
+    fmt: "fmt"

@@ -1,0 +1,122 @@
+<div align="center">
+  <img src="./docs/assets/otel-logo.png" alt="OpenTelemetry Logo" width="500" />
+  <br />
+  <img src="https://img.shields.io/badge/Go-1.26%2B-4A90E2?style=flat&logo=go" alt="Go" />
+  <img src="https://img.shields.io/badge/License-Apache%202.0-4A90E2?style=flat&logo=apache" alt="License" />
+  <img src="https://img.shields.io/badge/Status-Stable-4A90E2?style=flat&logo=github" alt="Status" />
+  <img src="https://img.shields.io/badge/Slack-CNCF-FF6B35?style=flat&logo=slack" alt="Slack" />
+</div>
+
+## Overview
+
+This project provides a tool to automatically instrument Go applications with [OpenTelemetry](https://opentelemetry.io/) at compile-time.
+It modifies the Go build process to inject OpenTelemetry code into the application **without requiring manual changes to the source code**.
+
+Highlights:
+
+- **Zero Runtime Overhead[^1]** - Instrumentation is baked into your binary at compile time
+- **Zero Code Changes** - Automatically instrument entire applications and dependencies
+- **Third-Party Library Support** - Instrument libraries you don't control
+- **Complete Decoupling** - Keep your codebase free from instrumentation concerns
+- **Flexible Deployment** - Integrate at development time or in your CI/CD pipeline
+
+## Quick Start
+
+### 1. Build the Tool
+
+```bash
+git clone https://github.com/open-telemetry/opentelemetry-go-compile-instrumentation.git
+cd opentelemetry-go-compile-instrumentation
+make build
+```
+
+The `otelc` binary will be built in the root directory.
+
+### 2. Try the Demo
+
+Just prefix the original `go build` command with `otelc`.
+
+```bash
+cd demo/app/basic
+../../../otelc go build
+./basic
+[... output ...]
+```
+
+### 3. Run the Tests
+
+```bash
+make test
+```
+
+## Community
+
+### Documentation
+
+- [Getting Started Guide](./docs/getting-started.md) - Setup and usage
+- [UX Design](./docs/ux-design.md) - Configuration options
+- [Implementation Details](./docs/implementation.md) - Technical architecture
+- [API Design](./docs/api-design-and-project-structure.md) - API structure
+- [Semantic Conventions](./docs/semantic-conventions.md) - Managing semantic conventions
+- [Instrumentation Guide](./docs/instrument-guide.md) - Add instrumentation hook for new libraries
+- [Instrumentation Rules](./docs/rules.md) - Rule types and YAML format reference
+- [Configuration and Fine-Tuning](./docs/configuration.md) - Scope, filter, and tune instrumentation
+- [Troubleshooting](./docs/troubleshooting.md) - Diagnose why instrumentation was not applied
+- [External Configuration Sources](./docs/external-configuration.md) - Declare instrumentations via `otel.instrumentation.go`
+- [Testing](./docs/testing.md) - Testing strategy, categories, and how to run tests
+
+### Video Talks
+
+- [Project Overview](https://www.youtube.com/watch?v=xEsVOhBdlZY)
+- [Deep Dive Details](https://www.youtube.com/watch?v=8Rw-fVEjihw&list=PLDWZ5uzn69ewrYyHTNrXlrWVDjLiOX0Yb&index=19)
+
+### Get Help
+
+- [GitHub Discussions](https://github.com/open-telemetry/opentelemetry-go-compile-instrumentation/discussions) - Ask questions
+- [GitHub Issues](https://github.com/open-telemetry/opentelemetry-go-compile-instrumentation/issues) - Report bugs
+- [Slack Channel](https://cloud-native.slack.com/archives/C088D8GSSSF) - Real-time chat
+- [Calendar](https://github.com/open-telemetry/community/#sig-go-compile-instrumentation) - Community meetings (Thursdays, UTC: 08:00 – 09:00)
+
+## Contributing
+
+We welcome contributions! See our [contributing guide](CONTRIBUTING.md) and [development docs](./docs/).
+
+This project follows the [OpenTelemetry Code of Conduct](https://github.com/open-telemetry/community/blob/main/code-of-conduct.md).
+Please also review our [AI usage policy](docs/AI_POLICY.md) if you use AI tools in your workflow.
+
+Here is a list of community roles with current and previous members:
+
+### Maintainers
+
+- [Azhar Momin](https://github.com/amazingakai), Independent
+- [Dario Castañe](https://github.com/darccio), Datadog
+- [Haibin Zhang](https://github.com/NameHaibinZhang), Alibaba
+- [Huxing Zhang](https://github.com/ralf0131), Alibaba
+- [Kemal Akkoyun](https://github.com/kakkoyun), Datadog
+- [Przemyslaw Delewski](https://github.com/pdelewski), Quesma
+- [Xabier Martinez](https://github.com/txabman42), Cabify
+- [Yi Yang](https://github.com/y1yang0), Alibaba
+
+For more information about the maintainer role, see the [community repository](https://github.com/open-telemetry/community/blob/main/guides/contributor/membership.md#maintainer).
+
+### Approvers
+
+For more information about the approver role, see the [community repository](https://github.com/open-telemetry/community/blob/main/guides/contributor/membership.md#approver).
+
+### Emeritus
+
+- [Dinesh Gurumurthy](https://github.com/dineshg13), Maintainer
+- [Eliott B](https://github.com/eliottness), Approver
+- [Liu Ziming](https://github.com/123liuziming), Maintainer
+- [Romain Marcadier](https://github.com/RomainMuller), Maintainer
+
+For more information about the emeritus role, see the
+[community repository](https://github.com/open-telemetry/community/blob/main/guides/contributor/membership.md#emeritus-maintainerapprovertriager).
+
+### Thanks to all of our contributors!
+
+<a href="https://github.com/open-telemetry/opentelemetry-go-compile-instrumentation/graphs/contributors">
+  <img alt="Repo contributors" src="https://contrib.rocks/image?repo=open-telemetry/opentelemetry-go-compile-instrumentation" />
+</a>
+
+[^1]: No additional overhead from the instrumentation tool itself, on top of the overhead incurred by the injected [OpenTelemetry SDK](https://github.com/open-telemetry/opentelemetry-go/tree/736a14fcdca28b8cf5237e6b9b166ec6ed832bf7/sdk) code.

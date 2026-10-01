@@ -1,0 +1,1985 @@
+// Copyright The OpenTelemetry Authors
+// SPDX-License-Identifier: Apache-2.0
+
+package setup
+
+import (
+	"bytes"
+	"context"
+	"log/slog"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/dave/dst"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/otelc/tool/internal/ast"
+	"go.opentelemetry.io/otelc/tool/internal/rule"
+	"go.opentelemetry.io/otelc/tool/util"
+	"go.yaml.in/yaml/v3"
+	"golang.org/x/tools/go/packages"
+)
+
+func TestNormalizeRule(t *testing.T) {
+	tests := []struct {
+		name      string
+		input     map[string]any
+		expect    []map[string]any
+		expectErr string
+	}{
+		{
+			name: "flat format passthrough",
+			input: map[string]any{
+				"target": "net/http",
+				"func":   "ServeHTTP",
+				"before": "BeforeHook",
+				"path":   "github.com/example/pkg",
+			},
+			expect: []map[string]any{{
+				"target": "net/http",
+				"func":   "ServeHTTP",
+				"before": "BeforeHook",
+				"path":   "github.com/example/pkg",
+			}},
+		},
+		{
+			name: "top-level target version with where selectors and where.file",
+			input: map[string]any{
+				"target":  "database/sql",
+				"version": "v1.0.0,v2.0.0",
+				"where": map[string]any{
+					"func": "Open",
+					"file": map[string]any{
+						"has_func": "init",
+					},
+				},
+				"do": []any{
+					map[string]any{"inject_hooks": map[string]any{
+						"before": "BeforeServeHTTP",
+						"after":  "AfterServeHTTP",
+						"path":   "github.com/example/pkg",
+					}},
+				},
+			},
+			expect: []map[string]any{{
+				"target":  "database/sql",
+				"version": "v1.0.0,v2.0.0",
+				"func":    "Open",
+				"before":  "BeforeServeHTTP",
+				"after":   "AfterServeHTTP",
+				"path":    "github.com/example/pkg",
+				"where": map[string]any{
+					"file": map[string]any{
+						"has_func": "init",
+					},
+				},
+			}},
+		},
+		{
+			name: "multiple do items preserve declaration order",
+			input: map[string]any{
+				"target": "main",
+				"where": map[string]any{
+					"func": "Example",
+				},
+				"do": []any{
+					map[string]any{"inject_hooks": map[string]any{
+						"before": "BeforeHook",
+						"path":   "example.com/hooks",
+					}},
+					map[string]any{"inject_code": map[string]any{
+						"raw": "defer func(){}()",
+					}},
+				},
+			},
+			expect: []map[string]any{
+				{
+					"target": "main",
+					"func":   "Example",
+					"before": "BeforeHook",
+					"path":   "example.com/hooks",
+				},
+				{
+					"target": "main",
+					"func":   "Example",
+					"raw":    "defer func(){}()",
+				},
+			},
+		},
+		{
+			name: "where one-of and not are preserved for later phases",
+			input: map[string]any{
+				"target": "main",
+				"where": map[string]any{
+					"func": "Open",
+					"one-of": []any{
+						map[string]any{"file": map[string]any{"has_func": "init"}},
+						map[string]any{"not": map[string]any{"directive": "otelc:ignore"}},
+					},
+				},
+				"do": []any{
+					map[string]any{"inject_hooks": map[string]any{
+						"before": "BeforeOpen",
+						"path":   "example.com/hooks",
+					}},
+				},
+			},
+			expect: []map[string]any{{
+				"target": "main",
+				"func":   "Open",
+				"before": "BeforeOpen",
+				"path":   "example.com/hooks",
+				"where": map[string]any{
+					"one-of": []any{
+						map[string]any{"file": map[string]any{"has_func": "init"}},
+						map[string]any{"not": map[string]any{"directive": "otelc:ignore"}},
+					},
+				},
+			}},
+		},
+		{
+			name: "repeated modifier kinds are allowed",
+			input: map[string]any{
+				"target": "main",
+				"where": map[string]any{
+					"func": "Example",
+				},
+				"do": []any{
+					map[string]any{"inject_hooks": map[string]any{
+						"before": "BeforeOne",
+						"path":   "example.com/hooks",
+					}},
+					map[string]any{"inject_hooks": map[string]any{
+						"before": "BeforeTwo",
+						"path":   "example.com/hooks",
+					}},
+				},
+			},
+			expect: []map[string]any{
+				{
+					"target": "main",
+					"func":   "Example",
+					"before": "BeforeOne",
+					"path":   "example.com/hooks",
+				},
+				{
+					"target": "main",
+					"func":   "Example",
+					"before": "BeforeTwo",
+					"path":   "example.com/hooks",
+				},
+			},
+		},
+		{
+			name: "do map form is sugar for one-element list",
+			input: map[string]any{
+				"target": "main",
+				"where": map[string]any{
+					"func": "Example",
+				},
+				"do": map[string]any{
+					"inject_hooks": map[string]any{
+						"before": "BeforeHook",
+						"path":   "example.com/hooks",
+					},
+				},
+			},
+			expect: []map[string]any{{
+				"target": "main",
+				"func":   "Example",
+				"before": "BeforeHook",
+				"path":   "example.com/hooks",
+			}},
+		},
+		{
+			name: "do map form with multiple keys rejected",
+			input: map[string]any{
+				"target": "main",
+				"where":  map[string]any{"func": "Example"},
+				"do": map[string]any{
+					"inject_hooks": map[string]any{"before": "BeforeHook"},
+					"inject_code":  map[string]any{"raw": "_ = 0"},
+				},
+			},
+			expectErr: "exactly one modifier key when written as a map",
+		},
+		{
+			name: "target in where rejected",
+			input: map[string]any{
+				"target": "main",
+				"where": map[string]any{
+					"target": "net/http",
+					"func":   "ServeHTTP",
+				},
+				"do": []any{
+					map[string]any{"inject_hooks": map[string]any{
+						"before": "BeforeHook",
+						"path":   "example.com/hooks",
+					}},
+				},
+			},
+			expectErr: "target must be top-level",
+		},
+		{
+			name: "missing do rejected",
+			input: map[string]any{
+				"target": "main",
+				"where":  map[string]any{"func": "Fn"},
+			},
+			expectErr: "missing do",
+		},
+		{
+			name: "empty do rejected",
+			input: map[string]any{
+				"target": "main",
+				"where":  map[string]any{"func": "Fn"},
+				"do":     []any{},
+			},
+			expectErr: "do must not be empty",
+		},
+		{
+			name: "invalid do item with multiple keys rejected",
+			input: map[string]any{
+				"target": "main",
+				"where":  map[string]any{"func": "Fn"},
+				"do": []any{
+					map[string]any{
+						"inject_hooks": map[string]any{"before": "BeforeHook"},
+						"inject_code":  map[string]any{"raw": "_ = 0"},
+					},
+				},
+			},
+			expectErr: "exactly one modifier key",
+		},
+		{
+			name: "malformed where.file rejected",
+			input: map[string]any{
+				"target": "main",
+				"where": map[string]any{
+					"func": "Fn",
+					"file": "not-a-map",
+				},
+				"do": []any{
+					map[string]any{"inject_hooks": map[string]any{
+						"before": "BeforeHook",
+						"path":   "example.com/hooks",
+					}},
+				},
+			},
+			expectErr: "where.file must be a map",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := rule.Normalize(tt.input)
+			if tt.expectErr != "" {
+				require.ErrorContains(t, err, tt.expectErr)
+				return
+			}
+			require.NoError(t, err)
+			wantYAML, _ := yaml.Marshal(tt.expect)
+			gotYAML, _ := yaml.Marshal(got)
+			require.YAMLEq(t, string(wantYAML), string(gotYAML))
+		})
+	}
+}
+
+func TestCreateRuleFromFields(t *testing.T) {
+	tests := []struct {
+		name         string
+		yamlContent  string
+		ruleName     string
+		expectError  bool
+		expectedType string
+	}{
+		{
+			name: "struct rule creation",
+			yamlContent: `
+struct: TestStruct
+target: github.com/example/lib
+`,
+			ruleName:     "test-struct-rule",
+			expectError:  false,
+			expectedType: "*rule.InstStructRule",
+		},
+		{
+			name: "func rule creation",
+			yamlContent: `
+func: TestFunc
+target: github.com/example/lib
+before: MyHook1Before
+path: github.com/example/lib
+`,
+			ruleName:     "test-func-rule",
+			expectError:  false,
+			expectedType: "*rule.InstFuncRule",
+		},
+		{
+			name: "file rule creation",
+			yamlContent: `
+file: test.go
+target: github.com/example/lib
+path: github.com/example/lib
+`,
+			ruleName:     "test-file-rule",
+			expectError:  false,
+			expectedType: "*rule.InstFileRule",
+		},
+		{
+			name: "raw rule creation",
+			yamlContent: `
+raw: test
+target: github.com/example/lib
+`,
+			ruleName:     "test-raw-rule",
+			expectError:  false,
+			expectedType: "*rule.InstRawRule",
+		},
+		{
+			name: "rule with version",
+			yamlContent: `
+struct: TestStruct
+target: github.com/example/lib
+version: v1.0.0,v2.0.0
+`,
+			ruleName:     "test-versioned-rule",
+			expectError:  false,
+			expectedType: "*rule.InstStructRule",
+		},
+		{
+			name: "directive rule creation",
+			yamlContent: `
+directive: "otelc:span"
+target: github.com/example/lib
+template: "_ = 0"
+`,
+			ruleName:     "test-directive-rule",
+			expectError:  false,
+			expectedType: "*rule.InstDirectiveRule",
+		},
+		{
+			name: "directive rule missing field",
+			yamlContent: `
+directive: ""
+target: github.com/example/lib
+`,
+			ruleName:    "test-invalid-directive-rule",
+			expectError: true,
+		},
+		{
+			name: "decl rule creation",
+			yamlContent: `
+target: github.com/example/lib
+identifier: GlobalVar
+replace: "replaced"
+`,
+			ruleName:     "test-decl-rule",
+			expectError:  false,
+			expectedType: "*rule.InstDeclRule",
+		},
+		{
+			name: "invalid yaml syntax",
+			yamlContent: `
+struct: [
+target: github.com/example/lib
+`,
+			ruleName:    "test-invalid-rule",
+			expectError: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			testCreateRuleFromFieldsCase(t, tt)
+		})
+	}
+}
+
+func testCreateRuleFromFieldsCase(t *testing.T, tt struct {
+	name         string
+	yamlContent  string
+	ruleName     string
+	expectError  bool
+	expectedType string
+},
+) {
+	var fields map[string]any
+	err := yaml.Unmarshal([]byte(tt.yamlContent), &fields)
+	if err != nil {
+		if !tt.expectError {
+			t.Fatalf("failed to parse test YAML: %v", err)
+		}
+		return // Expected YAML parsing to fail
+	}
+
+	doc, err := rule.ParseFile([]byte(tt.ruleName + ":\n" + strings.ReplaceAll(tt.yamlContent, "\n", "\n  ")))
+	if err == nil {
+		var rules []rule.InstRule
+		rules, err = doc.Rules()
+		if len(rules) > 0 {
+			validateCreatedRule(t, rules[0], tt.ruleName, fields)
+		}
+	}
+
+	if tt.expectError {
+		if err == nil {
+			t.Error("expected error but got none")
+		}
+		return
+	}
+
+	if err != nil {
+		t.Errorf("unexpected error: %v", err)
+		return
+	}
+}
+
+func validateCreatedRule(t *testing.T, createdRule rule.InstRule, ruleName string, fields map[string]any) {
+	if createdRule.GetName() != ruleName {
+		t.Errorf("rule name = %v, want %v", createdRule.GetName(), ruleName)
+	}
+
+	if target, ok := fields["target"].(string); ok {
+		if createdRule.GetTarget() != target {
+			t.Errorf("rule target = %v, want %v", createdRule.GetTarget(), target)
+		}
+	}
+
+	if version, ok := fields["version"].(string); ok {
+		if createdRule.GetVersion() != version {
+			t.Errorf("rule version = %v, want %v", createdRule.GetVersion(), version)
+		}
+	}
+}
+
+func writeCustomRules(t *testing.T, name, content string) string {
+	path := filepath.Join(t.TempDir(), name)
+	err := os.WriteFile(path, []byte(content), 0o644)
+	require.NoError(t, err)
+	return path
+}
+
+func TestRuleFilesFromDir(t *testing.T) {
+	content1 := `h1:
+  target: main
+  func: Example
+  raw: "_ = 1"`
+	content2 := `h2:
+  target: main
+  func: Example
+  raw: "_ = 1"`
+
+	// Manually make a temporary and sub temporary Directories
+	dir := t.TempDir()
+	subDir := filepath.Join(dir, "sub_dir")
+
+	err := os.Mkdir(subDir, 0o755)
+	require.NoError(t, err)
+
+	err = os.WriteFile(filepath.Join(dir, "r1.otelc.yaml"), []byte(content1), 0o644)
+	require.NoError(t, err)
+
+	err = os.WriteFile(filepath.Join(subDir, "r2.otelc.yaml"), []byte(content2), 0o644)
+	require.NoError(t, err)
+
+	t.Setenv(util.EnvOtelcRules, "")
+
+	sp := newTestSetupPhase()
+	sp.ruleConfig = dir
+
+	rules, err := sp.loadRules(t.Context(), nil)
+	require.NoError(t, err)
+	require.Len(t, rules, 2)
+}
+
+func TestMultipleRuleFiles(t *testing.T) {
+	content1 := `h1:
+  target: main
+  func: Example
+  raw: "_ = 1"`
+	content2 := `h2:
+  target: main
+  func: Example
+  raw: "_ = 1"`
+
+	p1 := writeCustomRules(t, "r1.yaml", content1)
+	p2 := writeCustomRules(t, "r2.yaml", content2)
+
+	t.Setenv(util.EnvOtelcRules, "")
+
+	sp := newTestSetupPhase()
+	sp.ruleConfig = p1 + "," + p2
+
+	rules, err := sp.loadRules(t.Context(), nil)
+	require.NoError(t, err)
+	require.Len(t, rules, 2)
+	names := []string{
+		rules[0].GetName(),
+		rules[1].GetName(),
+	}
+	require.Contains(t, names, "h1")
+	require.Contains(t, names, "h2")
+
+	// Check for duplicate rule by name
+	sp = newTestSetupPhase()
+	sp.ruleConfig = p1 + "," + p1
+
+	rules, err = sp.loadRules(t.Context(), nil)
+	require.NoError(t, err)
+	require.Len(t, rules, 1)
+	require.Equal(t, "h1", rules[0].GetName())
+}
+
+func TestLoadRules_InvalidVersionRange(t *testing.T) {
+	content := `broken:
+  target: main
+  version: "v1.0.0,"
+  func: Example
+  raw: "_ = 1"`
+
+	p := writeCustomRules(t, "broken.yaml", content)
+	t.Setenv(util.EnvOtelcRules, "")
+
+	sp := newTestSetupPhase()
+	sp.ruleConfig = p
+
+	_, err := sp.loadRules(t.Context(), nil)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), `rule "broken"`)
+	assert.Contains(t, err.Error(), `version "v1.0.0,"`)
+}
+
+func TestDoSequenceLoadsAllExpandedRules(t *testing.T) {
+	// A single YAML entry whose do: sequence carries multiple modifiers expands
+	// into one rule per modifier, all sharing the entry name. loadCustomRules
+	// must retain every expanded rule rather than collapsing them by name.
+	content := `combo:
+  target: main
+  where:
+    func: Example
+  do:
+    - inject_hooks:
+        before: BeforeExample
+        path: example.com/hooks
+    - inject_code:
+        raw: "_ = 1"`
+
+	p := writeCustomRules(t, "combo.yaml", content)
+	t.Setenv(util.EnvOtelcRules, "")
+
+	sp := newTestSetupPhase()
+	sp.ruleConfig = p
+
+	rules, err := sp.loadRules(t.Context(), nil)
+	require.NoError(t, err)
+	require.Len(t, rules, 2)
+	for _, r := range rules {
+		require.Equal(t, "combo", r.GetName())
+	}
+
+	// Both modifiers must be represented: inject_hooks -> InstFuncRule and
+	// inject_code -> InstRawRule.
+	var hasFunc, hasRaw bool
+	for _, r := range rules {
+		switch r.(type) {
+		case *rule.InstFuncRule:
+			hasFunc = true
+		case *rule.InstRawRule:
+			hasRaw = true
+		}
+	}
+	require.True(t, hasFunc, "expected an InstFuncRule from inject_hooks")
+	require.True(t, hasRaw, "expected an InstRawRule from inject_code")
+
+	// Re-reading the same file must still dedupe the entry as a unit: the
+	// group is replaced, not appended, so the count stays at 2 (not 4).
+	sp = newTestSetupPhase()
+	sp.ruleConfig = p + "," + p
+
+	rules, err = sp.loadRules(t.Context(), nil)
+	require.NoError(t, err)
+	require.Len(t, rules, 2)
+}
+
+func TestLoadRulesFromToolFiles(t *testing.T) {
+	t.Run("loads rules from tool files", func(t *testing.T) {
+		tmp := t.TempDir()
+
+		rootTool := writeInstrumentationModule(t, tmp, "example.com/root", false, map[string]string{
+			"example.com/foo": filepath.Join(tmp, "foo"),
+		})
+		writeInstrumentationModule(t, filepath.Join(tmp, "foo"), "example.com/foo", true, nil)
+
+		rules, err := loadRulesFromToolFiles(t.Context(), []string{rootTool})
+		require.NoError(t, err)
+		require.Len(t, rules, 1)
+		require.Equal(t, "dummyrule", rules[0].GetName())
+	})
+
+	t.Run("loads nested tool files recursively", func(t *testing.T) {
+		tmp := t.TempDir()
+
+		rootTool := writeInstrumentationModule(t, tmp, "example.com/root", false, map[string]string{
+			"example.com/foo": filepath.Join(tmp, "foo"),
+		})
+		writeInstrumentationModule(t, filepath.Join(tmp, "foo"), "example.com/foo", false, map[string]string{
+			"example.com/bar": filepath.Join(tmp, "bar"),
+		})
+		writeInstrumentationModule(t, filepath.Join(tmp, "bar"), "example.com/bar", true, nil)
+
+		rules, err := loadRulesFromToolFiles(t.Context(), []string{rootTool})
+		require.NoError(t, err)
+		require.Len(t, rules, 1)
+		require.Equal(t, "dummyrule", rules[0].GetName())
+	})
+
+	t.Run("duplicate rule names from different packages are preserved", func(t *testing.T) {
+		tmp := t.TempDir()
+
+		rootTool := writeInstrumentationModule(t, tmp, "example.com/root", false, map[string]string{
+			"example.com/foo": filepath.Join(tmp, "foo"),
+			"example.com/bar": filepath.Join(tmp, "bar"),
+		})
+
+		// foo and bar both define a rule with the same name.
+		writeInstrumentationModule(t, filepath.Join(tmp, "foo"), "example.com/foo", true, nil)
+		writeInstrumentationModule(t, filepath.Join(tmp, "bar"), "example.com/bar", true, nil)
+
+		rules, err := loadRulesFromToolFiles(t.Context(), []string{rootTool})
+		require.NoError(t, err)
+		require.Len(t, rules, 2)
+		require.Equal(t, "dummyrule", rules[0].GetName())
+		require.Equal(t, "dummyrule", rules[1].GetName())
+	})
+
+	t.Run("returns instrumentation walk errors", func(t *testing.T) {
+		tmp := t.TempDir()
+
+		rootTool := writeInstrumentationModule(t, tmp, "example.com/root", false, map[string]string{
+			"example.com/notinstrumentation": filepath.Join(tmp, "notinstrumentation"),
+		})
+
+		// Valid module, but not an instrumentation package.
+		writeInstrumentationModule(t, filepath.Join(tmp, "notinstrumentation"), "example.com/notinstrumentation",
+			false, nil)
+
+		_, err := loadRulesFromToolFiles(t.Context(), []string{rootTool})
+		require.ErrorIs(t, err, errNotInstrumentation)
+	})
+}
+
+func TestLoadDefaultRules(t *testing.T) {
+	tmp := t.TempDir()
+
+	// Write custom rules to temporary files
+	content1 := `h1:
+  target: main
+  func: Example
+  raw: "_ = 1"`
+	content2 := `h2:
+  target: main
+  func: Example
+  raw: "_ = 1"`
+	p1 := writeCustomRules(t, "r1.yaml", content1)
+	p2 := writeCustomRules(t, "r2.yaml", content2)
+	writeInstrumentationModule(t, tmp, "example.com/root", false, map[string]string{
+		"example.com/foo": filepath.Join(tmp, "foo"),
+	})
+	writeInstrumentationModule(t, filepath.Join(tmp, "foo"), "example.com/foo", true, nil)
+	moduleDirs := map[string]bool{tmp: true}
+
+	// Prepare setup phase and set custom rules via environment variable and flag
+	sp := newTestSetupPhase()
+	t.Setenv(util.EnvOtelcRules, p1)
+	sp.ruleConfig = p2
+
+	// Verify that the custom rule specified by environment variable has
+	// higher priority than the custom rule specified by flag
+	rules, err := sp.loadRules(t.Context(), moduleDirs)
+	require.NoError(t, err)
+	require.NotEmpty(t, rules)
+	require.Len(t, rules, 1)
+	require.Equal(t, "h1", rules[0].GetName())
+
+	// Verify that the custom rule specified by flag has higher priority than
+	// default rules
+	t.Setenv(util.EnvOtelcRules, "")
+	rules, err = sp.loadRules(t.Context(), moduleDirs)
+	require.NoError(t, err)
+	require.NotEmpty(t, rules)
+	require.Len(t, rules, 1)
+	require.Equal(t, "h2", rules[0].GetName())
+
+	// Verify that when both custom rule specified by environment variable and flag are empty,
+	// rules are loaded from otel.instrumentation.go/otelc.tool.go file.
+	t.Setenv(util.EnvOtelcRules, "")
+	sp.ruleConfig = ""
+	rules, err = sp.loadRules(t.Context(), moduleDirs)
+	require.NoError(t, err)
+	require.NotEmpty(t, rules)
+	require.Len(t, rules, 1)
+	require.Equal(t, "dummyrule", rules[0].GetName()) // writeInstrumentationModule adds a rule named "dummyrule"
+
+	// Verify that when no rules are found, no error is returned and nil is returned.
+	os.Remove(filepath.Join(tmp, toolFileCanonical))
+	rules, err = sp.loadRules(t.Context(), moduleDirs)
+	require.NoError(t, err)
+	require.Nil(t, rules)
+}
+
+func TestPreciseMatching_WhereFileFilter(t *testing.T) {
+	matchFile := writeGoSource(t, "match.go", "package main\n\ntype Server struct{}\n\nfunc Handler() {}\n")
+	noMatchFile := writeGoSource(t, "nomatch.go", "package main\n\nfunc Handler() {}\n")
+
+	dep := &Dependency{
+		ImportPath: "example.com/svc",
+		Sources:    []string{matchFile, noMatchFile},
+	}
+
+	funcRule := &rule.InstFuncRule{
+		InstBaseRule: rule.InstBaseRule{
+			Name:   "test-where-file",
+			Target: "example.com/svc",
+			Where: &rule.WhereDef{
+				File: &rule.FilterDef{HasStruct: "Server"},
+			},
+		},
+		Func:   "Handler",
+		Before: "BeforeHandler",
+		Path:   "example.com/hooks",
+	}
+
+	sp := newTestSetupPhase()
+	set := rule.NewInstRuleSet(dep.ImportPath)
+
+	result, err := sp.preciseMatching(t.Context(), dep, []rule.InstRule{funcRule}, set)
+	require.NoError(t, err)
+	require.Len(t, result.FuncRules, 1)
+	require.Contains(t, result.FuncRules, matchFile)
+}
+
+func TestPreciseMatching_WhereFileAllOf(t *testing.T) {
+	// all-of requires the file to declare BOTH a Handler func and a Server
+	// struct. Only match.go satisfies both; nomatch.go is gated out.
+	matchFile := writeGoSource(t, "match.go", "package main\n\ntype Server struct{}\n\nfunc Handler() {}\n")
+	noMatchFile := writeGoSource(t, "nomatch.go", "package main\n\nfunc Handler() {}\n")
+
+	dep := &Dependency{
+		ImportPath: "example.com/svc",
+		Sources:    []string{matchFile, noMatchFile},
+	}
+
+	funcRule := &rule.InstFuncRule{
+		InstBaseRule: rule.InstBaseRule{
+			Name:   "test-where-file-all-of",
+			Target: "example.com/svc",
+			Where: &rule.WhereDef{
+				File: &rule.FilterDef{
+					AllOf: []rule.FilterDef{
+						{HasFunc: "Handler"},
+						{HasStruct: "Server"},
+					},
+				},
+			},
+		},
+		Func:   "Handler",
+		Before: "BeforeHandler",
+		Path:   "example.com/hooks",
+	}
+
+	sp := newTestSetupPhase()
+	set := rule.NewInstRuleSet(dep.ImportPath)
+
+	result, err := sp.preciseMatching(t.Context(), dep, []rule.InstRule{funcRule}, set)
+	require.NoError(t, err)
+	require.Len(t, result.FuncRules, 1)
+	require.Contains(t, result.FuncRules, matchFile)
+	require.NotContains(t, result.FuncRules, noMatchFile)
+}
+
+func TestPreciseMatching_CallRuleAddedToAllFiles(t *testing.T) {
+	matchFile := writeGoSource(
+		t,
+		"calls.go",
+		"package main\n\nimport \"unsafe\"\n\nfunc CallSizeof() {\n\t_ = unsafe.Sizeof(42)\n}\n",
+	)
+	noMatchFile := writeGoSource(t, "other.go", "package main\n\nfunc Helper() { println(\"hi\") }\n")
+
+	dep := &Dependency{
+		ImportPath: "example.com/app",
+		Sources:    []string{matchFile, noMatchFile},
+	}
+
+	callRule := &rule.InstCallRule{
+		InstBaseRule: rule.InstBaseRule{
+			Name:   "wrap-sizeof",
+			Target: "example.com/app",
+		},
+		FunctionCall: "unsafe.Sizeof",
+		ImportPath:   "unsafe",
+		FuncName:     "Sizeof",
+		Replace:      "Wrapper({{ . }})",
+	}
+
+	sp := newTestSetupPhase()
+	set := rule.NewInstRuleSet(dep.ImportPath)
+
+	result, err := sp.preciseMatching(t.Context(), dep, []rule.InstRule{callRule}, set)
+	require.NoError(t, err)
+	require.Len(t, result.CallRules, 2)
+	require.Contains(t, result.CallRules, matchFile)
+	require.Contains(t, result.CallRules, noMatchFile)
+}
+
+func TestPreciseMatching_WhereFileOneOf(t *testing.T) {
+	// one-of matches the file when it declares EITHER backend driver. The match
+	// file declares PostgresDriver (one of the two), so Open is selected; the
+	// no-match file declares neither, so it is gated out.
+	matchFile := writeGoSource(t, "match.go", "package main\n\ntype PostgresDriver struct{}\n\nfunc Open() {}\n")
+	noMatchFile := writeGoSource(t, "nomatch.go", "package main\n\nfunc Open() {}\n")
+
+	dep := &Dependency{
+		ImportPath: "example.com/svc",
+		Sources:    []string{matchFile, noMatchFile},
+	}
+
+	funcRule := &rule.InstFuncRule{
+		InstBaseRule: rule.InstBaseRule{
+			Name:   "test-where-file-one-of",
+			Target: "example.com/svc",
+			Where: &rule.WhereDef{
+				File: &rule.FilterDef{
+					OneOf: []rule.FilterDef{
+						{HasStruct: "MySQLDriver"},
+						{HasStruct: "PostgresDriver"},
+					},
+				},
+			},
+		},
+		Func:   "Open",
+		Before: "BeforeOpen",
+		Path:   "example.com/hooks",
+	}
+
+	sp := newTestSetupPhase()
+	set := rule.NewInstRuleSet(dep.ImportPath)
+
+	result, err := sp.preciseMatching(t.Context(), dep, []rule.InstRule{funcRule}, set)
+	require.NoError(t, err)
+	require.Len(t, result.FuncRules, 1)
+	require.Contains(t, result.FuncRules, matchFile)
+	require.NotContains(t, result.FuncRules, noMatchFile)
+}
+
+func TestPreciseMatching_WhereFileNot(t *testing.T) {
+	// not negates the inner predicate: the rule applies to files that do NOT
+	// declare MockConn. The match file defines Connect but no MockConn, so the
+	// negation holds and Connect is selected; the no-match file declares a
+	// MockConn test double, so the negation fails and the rule is gated out.
+	matchFile := writeGoSource(t, "match.go", "package main\n\nfunc Connect() {}\n")
+	noMatchFile := writeGoSource(t, "nomatch.go", "package main\n\ntype MockConn struct{}\n\nfunc Connect() {}\n")
+
+	dep := &Dependency{
+		ImportPath: "example.com/svc",
+		Sources:    []string{matchFile, noMatchFile},
+	}
+
+	funcRule := &rule.InstFuncRule{
+		InstBaseRule: rule.InstBaseRule{
+			Name:   "test-where-file-not",
+			Target: "example.com/svc",
+			Where: &rule.WhereDef{
+				File: &rule.FilterDef{
+					Not: &rule.FilterDef{HasStruct: "MockConn"},
+				},
+			},
+		},
+		Func:   "Connect",
+		Before: "BeforeConnect",
+		Path:   "example.com/hooks",
+	}
+
+	sp := newTestSetupPhase()
+	set := rule.NewInstRuleSet(dep.ImportPath)
+
+	result, err := sp.preciseMatching(t.Context(), dep, []rule.InstRule{funcRule}, set)
+	require.NoError(t, err)
+	require.Len(t, result.FuncRules, 1)
+	require.Contains(t, result.FuncRules, matchFile)
+	require.NotContains(t, result.FuncRules, noMatchFile)
+}
+
+func TestPreciseMatching_IsTestFilter(t *testing.T) {
+	// A test build is identified by _test.go files in the compile's source set —
+	// what `go test` feeds the compiler — not by the import path. is_test:true
+	// matches every file in such a build, including the production handler.go;
+	// is_test:false matches only non-test builds. Handle lives in handler.go, so
+	// adding handler_test.go to the source set is what flips the build to a test
+	// build without moving the matched function.
+	prodSrc := writeGoSource(t, "handler.go", "package main\n\nfunc Handle() {}\n")
+	testSrc := writeGoSource(t, "handler_test.go",
+		"package main\n\nimport \"testing\"\n\nfunc TestHandle(t *testing.T) { Handle() }\n")
+
+	tests := []struct {
+		name        string
+		shouldMatch bool // where.file.is_test
+		sources     []string
+		wantMatched bool
+	}{
+		{
+			name:        "is_test=true matches a test build",
+			shouldMatch: true,
+			sources:     []string{prodSrc, testSrc},
+			wantMatched: true,
+		},
+		{
+			name:        "is_test=true does not match a non-test build",
+			shouldMatch: true,
+			sources:     []string{prodSrc},
+			wantMatched: false,
+		},
+		{
+			name:        "is_test=false matches a non-test build",
+			shouldMatch: false,
+			sources:     []string{prodSrc},
+			wantMatched: true,
+		},
+		{
+			name:        "is_test=false does not match a test build",
+			shouldMatch: false,
+			sources:     []string{prodSrc, testSrc},
+			wantMatched: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			shouldMatch := tt.shouldMatch
+			funcRule := &rule.InstFuncRule{
+				InstBaseRule: rule.InstBaseRule{
+					Name:   "test-is-test-filter",
+					Target: "example.com/svc",
+					Where: &rule.WhereDef{
+						File: &rule.FilterDef{IsTest: &shouldMatch},
+					},
+				},
+				Func:   "Handle",
+				Before: "BeforeHandle",
+				Path:   "example.com/hooks",
+			}
+
+			dep := &Dependency{
+				ImportPath: "example.com/svc",
+				Sources:    tt.sources,
+			}
+
+			sp := newTestSetupPhase()
+			set := rule.NewInstRuleSet(dep.ImportPath)
+
+			result, err := sp.preciseMatching(t.Context(), dep, []rule.InstRule{funcRule}, set)
+			require.NoError(t, err)
+
+			if tt.wantMatched {
+				require.Len(t, result.FuncRules, 1,
+					"is_test=%v with sources %v: expected rule to match", tt.shouldMatch, tt.sources)
+			} else {
+				require.Empty(t, result.FuncRules,
+					"is_test=%v with sources %v: expected rule not to match", tt.shouldMatch, tt.sources)
+			}
+		})
+	}
+}
+
+func TestPreciseMatching_WhereFileFilterBuildError(t *testing.T) {
+	srcFile := writeGoSource(t, "src.go", "package main\n\nfunc Foo() {}\n")
+
+	dep := &Dependency{
+		ImportPath: "example.com/svc",
+		Sources:    []string{srcFile},
+	}
+
+	badRule := &rule.InstFuncRule{
+		InstBaseRule: rule.InstBaseRule{
+			Name:   "bad-where-file",
+			Target: "example.com/svc",
+			Where: &rule.WhereDef{
+				File: &rule.FilterDef{HasFunc: "Foo", HasStruct: "Bar"},
+			},
+		},
+		Func: "Foo",
+	}
+
+	sp := newTestSetupPhase()
+	set := rule.NewInstRuleSet(dep.ImportPath)
+
+	_, err := sp.preciseMatching(t.Context(), dep, []rule.InstRule{badRule}, set)
+	require.Error(t, err)
+	require.ErrorContains(t, err, "where.file has multiple active predicates")
+}
+
+// Helper functions for constructing test data
+
+func newTestSetupPhase() *setupPhase {
+	return &setupPhase{
+		logger: slog.New(slog.DiscardHandler),
+	}
+}
+
+func newTestFuncRule(path, target string) *rule.InstFuncRule {
+	return &rule.InstFuncRule{
+		InstBaseRule: rule.InstBaseRule{
+			Target: target,
+		},
+		Path: path,
+	}
+}
+
+func newTestFileRule(path, target string) *rule.InstFileRule {
+	return &rule.InstFileRule{
+		InstBaseRule: rule.InstBaseRule{
+			Target: target,
+		},
+		Path: path,
+	}
+}
+
+func newTestRuleSet(
+	modulePath string,
+	funcRules []*rule.InstFuncRule,
+	fileRules []*rule.InstFileRule,
+) *rule.InstRuleSet {
+	rs := rule.NewInstRuleSet(modulePath)
+	fakeFilePath := filepath.Join(os.TempDir(), "file.go")
+	for _, fr := range funcRules {
+		rs.AddFuncRule(fakeFilePath, fr)
+	}
+	for _, fr := range fileRules {
+		rs.AddFileRule(fr)
+	}
+	return rs
+}
+
+func writeGoSource(t *testing.T, name, content string) string {
+	path := filepath.Join(t.TempDir(), name)
+	err := os.WriteFile(path, []byte(content), 0o644)
+	require.NoError(t, err)
+	return path
+}
+
+func TestRunMatch_FileRuleOnlySetsPackageName(t *testing.T) {
+	dir := t.TempDir()
+	srcFile := filepath.Join(dir, "mypkg.go")
+	err := os.WriteFile(srcFile, []byte("package mypkg\n"), 0o644)
+	require.NoError(t, err)
+
+	const importPath = "example.com/mypkg"
+
+	yamlContent := []byte(`
+file: hook.go
+target: example.com/mypkg
+path: example.com/mypkg
+`)
+	fileRule, err := rule.NewInstFileRule(yamlContent, "test-file-rule")
+	require.NoError(t, err)
+
+	dep := &Dependency{
+		ImportPath: importPath,
+		Sources:    []string{srcFile},
+		CgoFiles:   make(map[string]string),
+	}
+
+	rulesByTarget := map[string][]rule.InstRule{
+		importPath: {fileRule},
+	}
+
+	sp := newTestSetupPhase()
+	set, err := sp.runMatch(context.Background(), dep, rulesByTarget, nil)
+	require.NoError(t, err)
+	require.NotNil(t, set)
+
+	assert.Equal(t, "mypkg", set.PackageName)
+	assert.False(t, set.IsEmpty(), "rule set must contain the file rule")
+}
+
+func TestRunMatch_FuncRuleSignatureFilters(t *testing.T) {
+	dir := t.TempDir()
+	srcFile := filepath.Join(dir, "mypkg.go")
+	err := os.WriteFile(srcFile, []byte(`package mypkg
+
+func Target(value string) error { return nil }
+`), 0o644)
+	require.NoError(t, err)
+
+	const importPath = "example.com/mypkg"
+	matchingSig := rule.FuncSignature{Args: []string{"string"}, Returns: []string{"error"}}
+	nonMatchingSig := rule.FuncSignature{Args: []string{"int"}, Returns: []string{"error"}}
+	matchingRule := &rule.InstFuncRule{
+		InstBaseRule: rule.InstBaseRule{Name: "matching", Target: importPath},
+		Func:         "Target",
+		Before:       "BeforeTarget",
+		Signature:    &matchingSig,
+	}
+	nonMatchingRule := &rule.InstFuncRule{
+		InstBaseRule: rule.InstBaseRule{Name: "non-matching", Target: importPath},
+		Func:         "Target",
+		Before:       "BeforeTarget",
+		Signature:    &nonMatchingSig,
+	}
+
+	dep := &Dependency{
+		ImportPath: importPath,
+		Sources:    []string{srcFile},
+		CgoFiles:   make(map[string]string),
+	}
+	rulesByTarget := map[string][]rule.InstRule{
+		importPath: {matchingRule, nonMatchingRule},
+	}
+
+	sp := newTestSetupPhase()
+	set, err := sp.runMatch(context.Background(), dep, rulesByTarget, nil)
+	require.NoError(t, err)
+	require.NotNil(t, set)
+
+	matchedFuncRules := set.AllFuncRules()
+	require.Len(t, matchedFuncRules, 1)
+	assert.Equal(t, "matching", matchedFuncRules[0].Name)
+}
+
+func TestParseRuleFromYamlDeterministicOrder(t *testing.T) {
+	yamlContent := []byte(`
+zebra:
+  target: main
+  func: Example
+  raw: "_ = 1"
+alpha:
+  target: main
+  func: Example
+  raw: "_ = 1"
+mangle:
+  target: main
+  func: Example
+  raw: "_ = 1"
+`)
+
+	doc, err := rule.ParseFile(yamlContent)
+	require.NoError(t, err)
+	rules, err := doc.Rules()
+	require.NoError(t, err)
+	require.Len(t, rules, 3)
+
+	names := make([]string, len(rules))
+	for i, r := range rules {
+		names[i] = r.GetName()
+	}
+	require.Equal(t, []string{"alpha", "mangle", "zebra"}, names)
+}
+
+func TestParseRuleFromYamlMinimumVersion(t *testing.T) {
+	doc, err := rule.ParseFile([]byte(`version: "v1.0.0"
+hook:
+  target: main
+  func: Example
+  raw: "_ = 1"
+`))
+	require.NoError(t, err)
+	rules, err := doc.Rules()
+	require.NoError(t, err)
+	require.Len(t, rules, 1)
+	assert.Equal(t, "hook", rules[0].GetName())
+}
+
+func TestCheckRuleFileVersion(t *testing.T) {
+	t.Run("accepts supported requirement", func(t *testing.T) {
+		doc, parseErr := rule.ParseFile([]byte(`version: "v1.0.0"`))
+		require.NoError(t, parseErr)
+		err := checkRuleFileVersion(t.Context(), "otelc.yaml", doc, "v1.1.0")
+		require.NoError(t, err)
+	})
+
+	t.Run("rejects newer requirement", func(t *testing.T) {
+		doc, parseErr := rule.ParseFile([]byte(`version: "v1.1.0"`))
+		require.NoError(t, parseErr)
+		err := checkRuleFileVersion(t.Context(), "client.otelc.yaml", doc, "v1.0.0")
+		require.ErrorContains(t, err, "client.otelc.yaml")
+		require.ErrorContains(t, err, "requires otelc >= v1.1.0")
+	})
+
+	t.Run("rejects malformed metadata", func(t *testing.T) {
+		_, err := rule.ParseFile([]byte(`version: 1`))
+		require.ErrorContains(t, err, "minimum otelc version must be a string")
+	})
+
+	t.Run("warns for legacy file", func(t *testing.T) {
+		var output bytes.Buffer
+		logger := slog.New(slog.NewTextHandler(&output, nil))
+		ctx := util.ContextWithLogger(t.Context(), logger)
+		doc, parseErr := rule.ParseFile([]byte("rule: {}"))
+		require.NoError(t, parseErr)
+		err := checkRuleFileVersion(ctx, "otelc.yaml", doc, util.Version)
+		require.NoError(t, err)
+		assert.Contains(t, output.String(), "no minimum otelc version")
+		assert.Contains(t, output.String(), "otelc.yaml")
+		assert.Contains(t, output.String(), "v1.0.0")
+	})
+}
+
+func TestLoadCustomRulesDeterministicOrder(t *testing.T) {
+	content := `zebra:
+  target: main
+  func: Example
+  raw: "_ = 1"
+alpha:
+  target: main
+  func: Example
+  raw: "_ = 1"
+mangle:
+  target: main
+  func: Example
+  raw: "_ = 1"`
+
+	p := writeCustomRules(t, "order.yaml", content)
+
+	rules, err := loadCustomRules(t.Context(), p)
+	require.NoError(t, err)
+	require.Len(t, rules, 3)
+
+	names := make([]string, len(rules))
+	for i, r := range rules {
+		names[i] = r.GetName()
+	}
+	require.Equal(t, []string{"alpha", "mangle", "zebra"}, names)
+}
+
+func TestRunMatch_EmptyRules(t *testing.T) {
+	dep := &Dependency{
+		ImportPath: "example.com/noop",
+		Sources:    []string{},
+		CgoFiles:   make(map[string]string),
+	}
+
+	sp := newTestSetupPhase()
+	set, err := sp.runMatch(context.Background(), dep, map[string][]rule.InstRule{}, nil)
+	require.NoError(t, err)
+	require.NotNil(t, set)
+	assert.True(t, set.IsEmpty())
+}
+
+func TestRunMatch_FileRuleInvalidSource(t *testing.T) {
+	dir := t.TempDir()
+	srcFile := filepath.Join(dir, "bad.go")
+	err := os.WriteFile(srcFile, []byte("not valid go source {{{"), 0o644)
+	require.NoError(t, err)
+
+	const importPath = "example.com/mypkg"
+
+	yamlContent := []byte(`
+file: hook.go
+target: example.com/mypkg
+path: example.com/mypkg
+`)
+	fileRule, err := rule.NewInstFileRule(yamlContent, "test-file-rule")
+	require.NoError(t, err)
+
+	dep := &Dependency{
+		ImportPath: importPath,
+		Sources:    []string{srcFile},
+		CgoFiles:   make(map[string]string),
+	}
+
+	rulesByTarget := map[string][]rule.InstRule{
+		importPath: {fileRule},
+	}
+
+	sp := newTestSetupPhase()
+	_, err = sp.runMatch(context.Background(), dep, rulesByTarget, nil)
+	assert.Error(t, err, "should fail when source file cannot be parsed")
+}
+
+func TestRunMatch_FileRuleNoSources(t *testing.T) {
+	const importPath = "example.com/mypkg"
+
+	yamlContent := []byte(`
+file: hook.go
+target: example.com/mypkg
+path: example.com/mypkg
+`)
+	fileRule, err := rule.NewInstFileRule(yamlContent, "test-file-rule")
+	require.NoError(t, err)
+
+	dep := &Dependency{
+		ImportPath: importPath,
+		Sources:    []string{},
+		CgoFiles:   make(map[string]string),
+	}
+
+	rulesByTarget := map[string][]rule.InstRule{
+		importPath: {fileRule},
+	}
+
+	sp := newTestSetupPhase()
+	set, err := sp.runMatch(context.Background(), dep, rulesByTarget, nil)
+	require.NoError(t, err)
+	require.NotNil(t, set)
+
+	assert.Empty(t, set.PackageName)
+	assert.False(t, set.IsEmpty())
+}
+
+// globFuncRule builds an InstFuncRule targeting Handler with the given target
+// pattern, for exercising the exact/glob split in runMatch.
+func globFuncRule(name, target string) *rule.InstFuncRule {
+	return &rule.InstFuncRule{
+		InstBaseRule: rule.InstBaseRule{
+			Name:   name,
+			Target: target,
+		},
+		Func:   "Handler",
+		Before: "BeforeHandler",
+		Path:   "example.com/hooks",
+	}
+}
+
+func TestRunMatch_GlobTargetMatches(t *testing.T) {
+	srcFile := writeGoSource(t, "svc.go", "package users\n\nfunc Handler() {}\n")
+	dep := &Dependency{
+		ImportPath: "example.com/svc/users",
+		Sources:    []string{srcFile},
+		CgoFiles:   make(map[string]string),
+	}
+
+	// "**" must match the multi-segment descendant example.com/svc/users.
+	globRule := globFuncRule("glob-rule", "example.com/svc/**")
+
+	sp := newTestSetupPhase()
+	set, err := sp.runMatch(
+		context.Background(),
+		dep,
+		map[string][]rule.InstRule{},
+		[]targetRule{{target: globRule.Target, rule: globRule}},
+	)
+	require.NoError(t, err)
+	require.Len(t, set.FuncRules, 1, "glob target should match the descendant package")
+	require.Contains(t, set.FuncRules, srcFile)
+}
+
+func TestRunMatch_GlobTargetNoMatch(t *testing.T) {
+	srcFile := writeGoSource(t, "other.go", "package other\n\nfunc Handler() {}\n")
+	dep := &Dependency{
+		ImportPath: "example.com/other",
+		Sources:    []string{srcFile},
+		CgoFiles:   make(map[string]string),
+	}
+
+	// The dependency is outside the example.com/svc family, so no rule applies.
+	globRule := globFuncRule("glob-rule", "example.com/svc/**")
+
+	sp := newTestSetupPhase()
+	set, err := sp.runMatch(
+		context.Background(),
+		dep,
+		map[string][]rule.InstRule{},
+		[]targetRule{{target: globRule.Target, rule: globRule}},
+	)
+	require.NoError(t, err)
+	require.True(t, set.IsEmpty(), "glob target must not match an unrelated package")
+}
+
+func TestRunMatch_SingleSegmentGlobDoesNotCrossBoundary(t *testing.T) {
+	srcFile := writeGoSource(t, "deep.go", "package v2\n\nfunc Handler() {}\n")
+	dep := &Dependency{
+		ImportPath: "example.com/svc/users/v2",
+		Sources:    []string{srcFile},
+		CgoFiles:   make(map[string]string),
+	}
+
+	// "*" matches a single segment only; it must not match the two-segment tail.
+	globRule := globFuncRule("glob-rule", "example.com/svc/*")
+
+	sp := newTestSetupPhase()
+	set, err := sp.runMatch(
+		context.Background(),
+		dep,
+		map[string][]rule.InstRule{},
+		[]targetRule{{target: globRule.Target, rule: globRule}},
+	)
+	require.NoError(t, err)
+	require.True(t, set.IsEmpty(), "single-segment glob must not cross a path boundary")
+}
+
+func TestRunMatch_ExactAndGlobCoexist(t *testing.T) {
+	srcFile := writeGoSource(t, "svc.go", "package users\n\nfunc Handler() {}\n")
+	dep := &Dependency{
+		ImportPath: "example.com/svc/users",
+		Sources:    []string{srcFile},
+		CgoFiles:   make(map[string]string),
+	}
+
+	// Both an exact-target rule and a glob-target rule resolve to this dep; the
+	// fast-path map lookup and the glob evaluation must both contribute.
+	exactRule := globFuncRule("exact-rule", "example.com/svc/users")
+	globRule := globFuncRule("glob-rule", "example.com/svc/**")
+
+	sp := newTestSetupPhase()
+	exactRules := map[string][]rule.InstRule{
+		"example.com/svc/users": {exactRule},
+	}
+	set, err := sp.runMatch(
+		context.Background(),
+		dep,
+		exactRules,
+		[]targetRule{{target: globRule.Target, rule: globRule}},
+	)
+	require.NoError(t, err)
+	require.Len(t, set.FuncRules[srcFile], 2, "both exact and glob rules should match")
+}
+
+func TestMatchDeps_GlobTargetSplit(t *testing.T) {
+	// A single rule file with a glob target must match every dependency in the
+	// targeted family, proving matchDeps routes glob rules through the evaluated
+	// path rather than the exact-key map.
+	dir := t.TempDir()
+	ruleFile := filepath.Join(dir, "glob.yaml")
+	err := os.WriteFile(ruleFile, []byte(`glob_hook:
+  target: example.com/svc/**
+  func: Handler
+  before: BeforeHandler
+  path: "example.com/hooks"
+`), 0o644)
+	require.NoError(t, err)
+
+	usersSrc := writeGoSource(t, "users.go", "package users\n\nfunc Handler() {}\n")
+	ordersSrc := writeGoSource(t, "orders.go", "package orders\n\nfunc Handler() {}\n")
+	unrelatedSrc := writeGoSource(t, "unrelated.go", "package other\n\nfunc Handler() {}\n")
+
+	sp := newTestSetupPhase()
+	sp.ruleConfig = ruleFile
+
+	deps := []*Dependency{
+		{ImportPath: "example.com/svc/users", Sources: []string{usersSrc}, CgoFiles: map[string]string{}},
+		{ImportPath: "example.com/svc/orders", Sources: []string{ordersSrc}, CgoFiles: map[string]string{}},
+		{ImportPath: "example.com/other", Sources: []string{unrelatedSrc}, CgoFiles: map[string]string{}},
+	}
+
+	matched, err := sp.matchDeps(context.Background(), deps, nil)
+	require.NoError(t, err)
+
+	matchedPaths := make(map[string]bool)
+	for _, m := range matched {
+		matchedPaths[m.ModulePath] = true
+	}
+	require.True(t, matchedPaths["example.com/svc/users"], "users package should match the glob target")
+	require.True(t, matchedPaths["example.com/svc/orders"], "orders package should match the glob target")
+	require.False(t, matchedPaths["example.com/other"], "unrelated package must not match")
+}
+
+func TestMatchDeps_RootTargetExpandsToRootModuleGlob(t *testing.T) {
+	dir := t.TempDir()
+	ruleFile := filepath.Join(dir, "root.yaml")
+	err := os.WriteFile(ruleFile, []byte(`root_hook:
+  target: $root
+  func: Handler
+  before: BeforeHandler
+  path: "example.com/hooks"
+`), 0o644)
+	require.NoError(t, err)
+
+	rootSrc := writeGoSource(t, "root.go", "package app\n\nfunc Handler() {}\n")
+	childSrc := writeGoSource(t, "child.go", "package child\n\nfunc Handler() {}\n")
+	pluginSrc := writeGoSource(t, "plugin.go", "package plugin\n\nfunc Handler() {}\n")
+	externalSrc := writeGoSource(t, "external.go", "package external\n\nfunc Handler() {}\n")
+	prefixSrc := writeGoSource(t, "prefix.go", "package prefix\n\nfunc Handler() {}\n")
+
+	sp := newTestSetupPhase()
+	sp.ruleConfig = ruleFile
+	sp.buildPackages = []*packages.Package{
+		{Module: &packages.Module{Path: "example.com/app"}},
+		{Module: &packages.Module{Path: "example.com/app/plugin"}},
+	}
+
+	deps := []*Dependency{
+		{ImportPath: "example.com/app", Sources: []string{rootSrc}, CgoFiles: map[string]string{}},
+		{ImportPath: "example.com/app/internal/child", Sources: []string{childSrc}, CgoFiles: map[string]string{}},
+		{ImportPath: "example.com/app/plugin", Sources: []string{pluginSrc}, CgoFiles: map[string]string{}},
+		{ImportPath: "example.com/other", Sources: []string{externalSrc}, CgoFiles: map[string]string{}},
+		{ImportPath: "example.com/appliance", Sources: []string{prefixSrc}, CgoFiles: map[string]string{}},
+	}
+
+	matched, err := sp.matchDeps(context.Background(), deps, nil)
+	require.NoError(t, err)
+
+	matchedPaths := make(map[string]bool)
+	for _, m := range matched {
+		matchedPaths[m.ModulePath] = true
+	}
+	require.True(t, matchedPaths["example.com/app"], "root package should match")
+	require.True(t, matchedPaths["example.com/app/internal/child"], "root sub-package should match")
+	require.True(t, matchedPaths["example.com/app/plugin"], "nested root package should match")
+	require.False(t, matchedPaths["example.com/other"], "external package must not match")
+	require.False(t, matchedPaths["example.com/appliance"], "prefix without slash boundary must not match")
+	for _, m := range matched {
+		if m.ModulePath == "example.com/app/plugin" {
+			require.Len(t, m.FuncRules[pluginSrc], 1, "overlapping roots must not apply the same rule twice")
+		}
+	}
+}
+
+func TestMatchDeps_RootTargetRequiresRootModule(t *testing.T) {
+	dir := t.TempDir()
+	ruleFile := filepath.Join(dir, "root.yaml")
+	err := os.WriteFile(ruleFile, []byte(`root_hook:
+  target: $root
+  func: Handler
+  before: BeforeHandler
+  path: "example.com/hooks"
+`), 0o644)
+	require.NoError(t, err)
+
+	sp := newTestSetupPhase()
+	sp.ruleConfig = ruleFile
+
+	_, err = sp.matchDeps(context.Background(), []*Dependency{
+		{ImportPath: "example.com/app", Sources: []string{}, CgoFiles: map[string]string{}},
+	}, nil)
+	require.Error(t, err)
+	require.ErrorContains(t, err, `target "$root"`)
+}
+
+func TestMatchDeps_InvalidGlobTargetRejected(t *testing.T) {
+	// A malformed glob target (unclosed bracket) must fail loudly at load time
+	// rather than silently matching nothing during the setup phase.
+	dir := t.TempDir()
+	ruleFile := filepath.Join(dir, "bad.yaml")
+	err := os.WriteFile(ruleFile, []byte(`bad_hook:
+  target: example.com/[svc
+  func: Handler
+  before: BeforeHandler
+  path: "example.com/hooks"
+`), 0o644)
+	require.NoError(t, err)
+
+	sp := newTestSetupPhase()
+	sp.ruleConfig = ruleFile
+
+	deps := []*Dependency{
+		{ImportPath: "example.com/svc/users", Sources: []string{}, CgoFiles: map[string]string{}},
+	}
+
+	_, err = sp.matchDeps(context.Background(), deps, nil)
+	require.Error(t, err)
+	require.ErrorContains(t, err, "not a valid glob pattern")
+}
+
+func TestMatchDeps_EmptyTargetRejected(t *testing.T) {
+	// target is required: an empty (or whitespace-only) target would land under
+	// exactRules[""] and silently never match, so the loader must reject it at
+	// load time rather than accepting a rule that can never fire.
+	dir := t.TempDir()
+	ruleFile := filepath.Join(dir, "empty.yaml")
+	err := os.WriteFile(ruleFile, []byte(`empty_hook:
+  target: "  "
+  func: Handler
+  before: BeforeHandler
+  path: "example.com/hooks"
+`), 0o644)
+	require.NoError(t, err)
+
+	sp := newTestSetupPhase()
+	sp.ruleConfig = ruleFile
+
+	deps := []*Dependency{
+		{ImportPath: "example.com/svc/users", Sources: []string{}, CgoFiles: map[string]string{}},
+	}
+
+	_, err = sp.matchDeps(context.Background(), deps, nil)
+	require.Error(t, err)
+	require.ErrorContains(t, err, "empty target")
+}
+
+func TestMatchDeps_NoMatchesWarning(t *testing.T) {
+	// Create a rule file that won't match any dependencies
+	dir := t.TempDir()
+	ruleFile := filepath.Join(dir, "nomatch.yaml")
+	err := os.WriteFile(ruleFile, []byte(`fake_hook:
+  target: github.com/fake/nonexistent
+  func: DoesNotExist
+  recv: ""
+  before: BeforeFake
+  after: AfterFake
+  path: "github.com/fake/nonexistent/hook"
+`), 0o644)
+	require.NoError(t, err)
+
+	sp := newTestSetupPhase()
+	sp.ruleConfig = ruleFile
+
+	deps := []*Dependency{
+		{
+			ImportPath: "net/http",
+			Sources:    []string{},
+			CgoFiles:   make(map[string]string),
+		},
+	}
+
+	matched, err := sp.matchDeps(t.Context(), deps, nil)
+	require.NoError(t, err)
+	assert.Empty(t, matched)
+}
+
+func TestRunMatch_WarnsOnUnresolvedVersion(t *testing.T) {
+	const importPath = "example.com/mypkg"
+
+	var buf bytes.Buffer
+	sp := &setupPhase{
+		logger: slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})),
+	}
+
+	dep := &Dependency{
+		ImportPath: importPath,
+		Version:    "",
+		Sources:    []string{},
+		CgoFiles:   make(map[string]string),
+	}
+	rulesByTarget := map[string][]rule.InstRule{
+		importPath: {
+			&rule.InstFuncRule{
+				InstBaseRule: rule.InstBaseRule{
+					Name:    "versioned_hook",
+					Target:  importPath,
+					Version: "v1.0.0",
+				},
+				Func:   "Target",
+				Before: "BeforeTarget",
+			},
+			&rule.InstFuncRule{
+				InstBaseRule: rule.InstBaseRule{
+					Name:    "another_versioned_hook",
+					Target:  importPath,
+					Version: "v2.0.0",
+				},
+				Func:   "Other",
+				Before: "BeforeOther",
+			},
+		},
+	}
+
+	set, err := sp.runMatch(context.Background(), dep, rulesByTarget, nil)
+	require.NoError(t, err)
+	require.NotNil(t, set)
+	assert.True(t, set.IsEmpty())
+
+	out := buf.String()
+	require.Contains(t, out, "unresolved")
+	require.Contains(t, out, "versioned_hook")
+	require.Contains(t, out, "another_versioned_hook")
+	require.Contains(t, out, importPath)
+}
+
+const matchOneRuleSource = `package sample
+
+const MaxRetries = 3
+
+type Widget struct{ x int }
+
+//sample:trace
+func Traced() {}
+
+func Plain() {}
+`
+
+func parseMatchSource(t *testing.T) *dst.File {
+	t.Helper()
+	tree, err := ast.NewAstParser().ParseSource(matchOneRuleSource)
+	require.NoError(t, err)
+	return tree
+}
+
+func TestMatchOneRule(t *testing.T) {
+	source := filepath.Join(t.TempDir(), "sample.go")
+	dep := &Dependency{ImportPath: "example.com/sample"}
+
+	tests := []struct {
+		name   string
+		rule   rule.InstRule
+		verify func(*testing.T, *rule.InstRuleSet)
+	}{
+		{
+			name: "func rule matches declared function",
+			rule: &rule.InstFuncRule{
+				InstBaseRule: rule.InstBaseRule{Target: "example.com/sample"},
+				Func:         "Plain",
+				Before:       "H",
+				Path:         "example.com/hooks",
+			},
+			verify: func(t *testing.T, set *rule.InstRuleSet) {
+				assert.Len(t, set.FuncRules[source], 1)
+			},
+		},
+		{
+			name: "func rule does not match missing function",
+			rule: &rule.InstFuncRule{
+				InstBaseRule: rule.InstBaseRule{Target: "example.com/sample"},
+				Func:         "DoesNotExist",
+				Before:       "H",
+				Path:         "example.com/hooks",
+			},
+			verify: func(t *testing.T, set *rule.InstRuleSet) {
+				assert.Empty(t, set.FuncRules[source])
+			},
+		},
+		{
+			name: "struct rule matches declared struct",
+			rule: &rule.InstStructRule{
+				InstBaseRule: rule.InstBaseRule{Target: "example.com/sample"},
+				Struct:       "Widget",
+			},
+			verify: func(t *testing.T, set *rule.InstRuleSet) {
+				assert.Len(t, set.StructRules[source], 1)
+			},
+		},
+		{
+			name: "raw rule matches declared function",
+			rule: &rule.InstRawRule{
+				InstBaseRule: rule.InstBaseRule{Target: "example.com/sample"},
+				Func:         "Plain",
+				Raw:          "println()",
+			},
+			verify: func(t *testing.T, set *rule.InstRuleSet) {
+				assert.Len(t, set.RawRules[source], 1)
+			},
+		},
+		{
+			name: "call rule is added unconditionally",
+			rule: &rule.InstCallRule{
+				InstBaseRule: rule.InstBaseRule{Target: "example.com/sample"},
+				FunctionCall: "net/http.Get",
+			},
+			verify: func(t *testing.T, set *rule.InstRuleSet) {
+				assert.Len(t, set.CallRules[source], 1)
+			},
+		},
+		{
+			name: "directive rule matches annotated function",
+			rule: &rule.InstDirectiveRule{
+				InstBaseRule: rule.InstBaseRule{Target: "example.com/sample"},
+				Directive:    "sample:trace",
+			},
+			verify: func(t *testing.T, set *rule.InstRuleSet) {
+				assert.Len(t, set.DirectiveRules[source], 1)
+			},
+		},
+		{
+			name: "decl rule matches named const",
+			rule: &rule.InstDeclRule{
+				InstBaseRule: rule.InstBaseRule{Target: "example.com/sample"},
+				Identifier:   "MaxRetries",
+				Kind:         "const",
+			},
+			verify: func(t *testing.T, set *rule.InstRuleSet) {
+				assert.Len(t, set.DeclRules[source], 1)
+			},
+		},
+		{
+			name: "file rule is skipped",
+			rule: &rule.InstFileRule{
+				InstBaseRule: rule.InstBaseRule{Target: "example.com/sample"},
+			},
+			verify: func(t *testing.T, set *rule.InstRuleSet) {
+				assert.Empty(t, set.FileRules)
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			sp := newTestSetupPhase()
+			set := rule.NewInstRuleSet("example.com/sample")
+			tree := parseMatchSource(t)
+
+			require.NoError(t, sp.matchOneRule(tree, source, tt.rule, set, dep))
+			tt.verify(t, set)
+		})
+	}
+}
+
+func TestCreateRuleFromFields_CallRule(t *testing.T) {
+	doc, err := rule.ParseFile(
+		[]byte("call-rule:\n  target: example.com/x\n  function_call: net/http.Get\n  replace: tracedGet({{ . }})\n"),
+	)
+	require.NoError(t, err)
+	rules, err := doc.Rules()
+	require.NoError(t, err)
+	require.IsType(t, &rule.InstCallRule{}, rules[0])
+}
+
+func TestCreateRuleFromFields_UnrecognizedSelector(t *testing.T) {
+	doc, err := rule.ParseFile([]byte("bad-rule:\n  target: example.com/x\n"))
+	require.NoError(t, err)
+	_, err = doc.Rules()
+	require.Error(t, err)
+	require.ErrorContains(t, err, "no recognised selector")
+}
+
+func TestParseRuleFromYaml_NormalizeError(t *testing.T) {
+	content := []byte(`bad:
+  target: main
+  where:
+    target: net/http
+    func: Open
+  do:
+    - inject_hooks:
+        before: BeforeOpen
+        path: example.com/hooks
+`)
+	doc, err := rule.ParseFile(content)
+	require.NoError(t, err)
+	_, err = doc.Rules()
+	require.Error(t, err)
+	require.ErrorContains(t, err, "target must be top-level")
+}
+
+func TestRunMatch_CgoFiles(t *testing.T) {
+	dep := &Dependency{
+		ImportPath: "example.com/cgo",
+		CgoFiles:   map[string]string{"a.go": "header"},
+	}
+
+	sp := newTestSetupPhase()
+	set, err := sp.runMatch(context.Background(), dep, nil, nil)
+	require.NoError(t, err)
+	require.True(t, set.IsEmpty())
+}
+
+func TestRunMatch_VersionFilteredOut(t *testing.T) {
+	srcFile := writeGoSource(t, "v.go", "package v\n\nfunc Handler() {}\n")
+	dep := &Dependency{
+		ImportPath: "example.com/v",
+		Version:    "v1.0.0",
+		Sources:    []string{srcFile},
+		CgoFiles:   map[string]string{},
+	}
+	funcRule := &rule.InstFuncRule{
+		InstBaseRule: rule.InstBaseRule{
+			Name:    "vrule",
+			Target:  "example.com/v",
+			Version: "v2.0.0",
+		},
+		Func:   "Handler",
+		Before: "BeforeHandler",
+		Path:   "example.com/hooks",
+	}
+
+	sp := newTestSetupPhase()
+	set, err := sp.runMatch(context.Background(), dep, map[string][]rule.InstRule{"example.com/v": {funcRule}}, nil)
+	require.NoError(t, err)
+	require.True(t, set.IsEmpty())
+}
+
+func TestPreciseMatching_NoSources(t *testing.T) {
+	dep := &Dependency{ImportPath: "example.com/empty"}
+	funcRule := &rule.InstFuncRule{
+		InstBaseRule: rule.InstBaseRule{Name: "r", Target: "example.com/empty"},
+		Func:         "Foo",
+	}
+
+	sp := newTestSetupPhase()
+	set := rule.NewInstRuleSet(dep.ImportPath)
+	res, err := sp.preciseMatching(context.Background(), dep, []rule.InstRule{funcRule}, set)
+	require.NoError(t, err)
+	require.True(t, res.IsEmpty())
+}
+
+func TestPreciseMatching_CtxCancelled(t *testing.T) {
+	srcFile := writeGoSource(t, "c.go", "package c\n\nfunc Foo() {}\n")
+	dep := &Dependency{
+		ImportPath: "example.com/c",
+		Sources:    []string{srcFile},
+	}
+	funcRule := &rule.InstFuncRule{
+		InstBaseRule: rule.InstBaseRule{Name: "r", Target: "example.com/c"},
+		Func:         "Foo",
+		Before:       "BeforeFoo",
+		Path:         "example.com/hooks",
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	sp := newTestSetupPhase()
+	set := rule.NewInstRuleSet(dep.ImportPath)
+	_, err := sp.preciseMatching(ctx, dep, []rule.InstRule{funcRule}, set)
+	require.ErrorIs(t, err, context.Canceled)
+}
+
+func TestPreciseMatching_MatchOneRuleError(t *testing.T) {
+	srcFile := writeGoSource(t, "s.go", "package s\n\nfunc Foo(a string) error { return nil }\n")
+	dep := &Dependency{
+		ImportPath: "example.com/s",
+		Sources:    []string{srcFile},
+	}
+	badRule := &rule.InstFuncRule{
+		InstBaseRule: rule.InstBaseRule{Name: "bad", Target: "example.com/s"},
+		Func:         "Foo",
+		Signature:    &rule.FuncSignature{Args: []string{"[]invalid"}},
+	}
+
+	sp := newTestSetupPhase()
+	set := rule.NewInstRuleSet(dep.ImportPath)
+	_, err := sp.preciseMatching(context.Background(), dep, []rule.InstRule{badRule}, set)
+	require.Error(t, err)
+}
+
+func TestRulesFromDirWalkError(t *testing.T) {
+	_, err := rulesFromDir(filepath.Join(t.TempDir(), "missing"), false)
+	require.Error(t, err)
+}
+
+func TestLoadCustomRulesStatError(t *testing.T) {
+	t.Setenv(util.EnvOtelcRules, "")
+	_, err := loadCustomRules(t.Context(), filepath.Join(t.TempDir(), "nope.yaml"))
+	require.Error(t, err)
+}
+
+func TestMatchDeps_NoRules(t *testing.T) {
+	t.Setenv(util.EnvOtelcRules, "")
+
+	sp := newTestSetupPhase()
+	matched, err := sp.matchDeps(context.Background(), []*Dependency{{ImportPath: "example.com/x"}}, nil)
+	require.NoError(t, err)
+	require.Nil(t, matched)
+}
+
+func TestMatchDeps_RunMatchError(t *testing.T) {
+	ruleFile := filepath.Join(t.TempDir(), "r.yaml")
+	err := os.WriteFile(ruleFile, []byte(`h:
+  target: example.com/bad
+  func: Handler
+  before: BeforeHandler
+  path: "example.com/hooks"
+`), 0o644)
+	require.NoError(t, err)
+
+	badSrc := writeGoSource(t, "bad.go", "not valid go {{{")
+	sp := newTestSetupPhase()
+	sp.ruleConfig = ruleFile
+
+	_, err = sp.matchDeps(context.Background(), []*Dependency{
+		{ImportPath: "example.com/bad", Sources: []string{badSrc}, CgoFiles: map[string]string{}},
+	}, nil)
+	require.Error(t, err)
+}
+
+func TestLoadRules_FindToolFilesError(t *testing.T) {
+	t.Setenv(util.EnvOtelcRules, "")
+	dir := t.TempDir()
+	err := os.WriteFile(filepath.Join(dir, toolFileCanonical), []byte("package main"), 0o644)
+	require.NoError(t, err)
+	err = os.WriteFile(filepath.Join(dir, toolFileAlias), []byte("package main"), 0o644)
+	require.NoError(t, err)
+
+	sp := newTestSetupPhase()
+	_, err = sp.loadRules(context.Background(), map[string]bool{dir: true})
+	require.Error(t, err)
+}
