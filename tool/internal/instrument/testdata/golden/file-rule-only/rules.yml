@@ -1,0 +1,6 @@
+add_new_file:
+  target: main
+  do:
+    - add_file:
+        file: newfile.go
+        path: testdata

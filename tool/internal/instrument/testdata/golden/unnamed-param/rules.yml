@@ -1,0 +1,8 @@
+hook_unnamed:
+  target: main
+  where:
+    func: Unnamed
+  do:
+    - inject_hooks:
+        before: H13Before
+        path: testdata/golden/unnamed-param

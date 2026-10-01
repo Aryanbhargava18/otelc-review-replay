@@ -1,0 +1,8 @@
+hook_before_only:
+  target: main
+  where:
+    func: EllipsisFunc
+  do:
+    - inject_hooks:
+        before: H9Before
+        path: testdata/golden/ellipsis-syntax

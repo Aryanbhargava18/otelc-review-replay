@@ -1,0 +1,34 @@
+hook_func:
+  target: main
+  where:
+    func: Func1
+  do:
+    - inject_hooks:
+        before: H1Before
+        after: H1After
+        path: testdata/golden/combined-rules
+
+add_field:
+  target: main
+  where:
+    struct: T
+  do:
+    - add_struct_fields:
+        new_field:
+          - name: NewField
+            type: string
+
+add_raw:
+  target: main
+  where:
+    func: Func1
+  do:
+    - inject_code:
+        raw: "_ = 789"
+
+add_file:
+  target: main
+  do:
+    - add_file:
+        file: newfile.go
+        path: testdata

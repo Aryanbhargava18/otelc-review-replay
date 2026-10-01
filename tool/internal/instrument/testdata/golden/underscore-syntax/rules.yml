@@ -1,0 +1,8 @@
+hook_underscore:
+  target: main
+  where:
+    func: UnderscoreFunc
+  do:
+    - inject_hooks:
+        before: H10Before
+        path: testdata/golden/underscore-syntax

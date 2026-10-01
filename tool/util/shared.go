@@ -1,0 +1,198 @@
+// Copyright The OpenTelemetry Authors
+// SPDX-License-Identifier: Apache-2.0
+
+package util
+
+import (
+	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+
+	"go.opentelemetry.io/otelc/tool/ex"
+	"golang.org/x/mod/semver"
+)
+
+const (
+	EnvOtelcWorkDir    = "OTELC_WORK_DIR"
+	EnvOtelcRules      = "OTELC_RULES"
+	EnvOtelcBuildFlags = "OTELC_BUILD_FLAGS"
+	// EnvOtelcStats enables per-toolexec timing stats when set to "1".
+	// Set automatically when --stats is used; propagated to child processes.
+	EnvOtelcStats = "OTELC_STATS"
+	// EnvOtelcDebug enables debug-level logging when set to "1".
+	// Set automatically when --debug is used; propagated to child processes.
+	EnvOtelcDebug = "OTELC_DEBUG"
+	// EnvOtelcNestedToolexec marks toolexec invocations spawned by a go
+	// command otelc itself ran (e.g. `go list -export`).
+	EnvOtelcNestedToolexec = "OTELC_NESTED_TOOLEXEC"
+	BuildTempDir           = ".otelc-build"
+	BuildLockFile          = BuildTempDir + ".lock"
+	OtelcRoot              = "go.opentelemetry.io/otelc"
+	OtelcPkgRoot           = OtelcRoot + "/pkg"
+	OtelcInstRoot          = OtelcRoot + "/instrumentation"
+	OtelcToolCmdRoot       = OtelcRoot + "/tool/cmd/otelc"
+	OtelcToolExe           = "otelc"
+)
+
+// IsRuleFile reports whether name identifies an otelc rule file.
+func IsRuleFile(name string) bool {
+	return name == "otelc.yml" ||
+		name == "otelc.yaml" ||
+		strings.HasSuffix(name, ".otelc.yml") ||
+		strings.HasSuffix(name, ".otelc.yaml")
+}
+
+func GetMatchedRuleFile() string {
+	const matchedRuleFile = "matched.json"
+	return GetBuildTemp(matchedRuleFile)
+}
+
+// GetAddedImportsFileForProcess returns the per-process import tracking file.
+// Each compile process writes to its own file to avoid inter-process race conditions.
+func GetAddedImportsFileForProcess() string {
+	pid := os.Getpid()
+	return GetBuildTemp(fmt.Sprintf("added_imports.%d.json", pid))
+}
+
+// GetAddedImportsPattern returns the glob pattern for all import tracking files.
+// Used by the link phase to discover and merge all per-process import files.
+func GetAddedImportsPattern() string {
+	return GetBuildTemp("added_imports.*.json")
+}
+
+// GetOtelcWorkDir returns the otelc working directory. It first checks the
+// OTELC_WORK_DIR environment variable; if unset, it falls back to the current
+// working directory. If the working directory cannot be determined, the process
+// exits via ex.Fatalf, since otelc cannot safely place build artifacts without
+// a known base path.
+func GetOtelcWorkDir() string {
+	wd := os.Getenv(EnvOtelcWorkDir)
+	if wd == "" {
+		var err error
+		wd, err = os.Getwd()
+		if err != nil {
+			ex.Fatalf("failed to get working directory: %v", err)
+		}
+	}
+	return wd
+}
+
+// DiscoverWorkDir finds the work directory prepared by `otelc setup` when
+// otelc runs as a bare `-toolexec` (OTELC_WORK_DIR unset because the build
+// was started by `go build`).
+//
+// Needed because the go toolchain runs some tools (asm, cgo) from the package
+// source directory, which may be the read-only module cache.
+func DiscoverWorkDir(dir string) string {
+	dir = filepath.Clean(dir)
+	for {
+		if PathExists(filepath.Join(dir, BuildTempDir)) {
+			return dir
+		}
+		if PathExists(filepath.Join(dir, "go.mod")) {
+			return ""
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return ""
+		}
+		dir = parent
+	}
+}
+
+// GetBuildTemp returns the path to the build temp directory $BUILD_TEMP/name
+func GetBuildTempDir() string {
+	return filepath.Join(GetOtelcWorkDir(), BuildTempDir)
+}
+
+// GetBuildTemp returns the path to the build temp directory $BUILD_TEMP/name
+func GetBuildTemp(name string) string {
+	return filepath.Join(GetOtelcWorkDir(), BuildTempDir, name)
+}
+
+// GetBuildFlags returns the build flags from OTELC_BUILD_FLAGS environment variable.
+// The flags are stored as a JSON-encoded string array to preserve arguments that contain spaces.
+// Returns nil if not set or on decode error.
+func GetBuildFlags() []string {
+	encoded := os.Getenv(EnvOtelcBuildFlags)
+	if encoded == "" {
+		return nil
+	}
+	var flags []string
+	if err := json.Unmarshal([]byte(encoded), &flags); err != nil {
+		// Malformed JSON, return nil
+		return nil
+	}
+	return flags
+}
+
+// EncodeBuildFlags encodes build flags as a JSON string for storage in an environment variable.
+// This preserves arguments that contain spaces (e.g., -tags "foo bar").
+func EncodeBuildFlags(flags []string) string {
+	if len(flags) == 0 {
+		return ""
+	}
+	encoded, err := json.Marshal(flags)
+	if err != nil {
+		return ""
+	}
+	return string(encoded)
+}
+
+// ValidateVersionRange validates the supported rule version syntax.
+//
+// Supported forms:
+//   - "" (empty string): match all versions
+//   - "v1.2.3": minimal supported version (>= v1.2.3)
+//   - "v1.2.3,v2.0.0": half-open range [v1.2.3, v2.0.0)
+func ValidateVersionRange(versionRange string) error {
+	if versionRange == "" {
+		return nil
+	}
+
+	if strings.Count(versionRange, ",") > 1 {
+		return ex.Newf("version %q must contain at most one comma", versionRange)
+	}
+
+	if startInclusive, endExclusive, ok := strings.Cut(versionRange, ","); ok {
+		if strings.TrimSpace(startInclusive) == "" || strings.TrimSpace(endExclusive) == "" {
+			return ex.Newf("version %q must use non-empty start and end bounds", versionRange)
+		}
+		if !semver.IsValid(startInclusive) || !semver.IsValid(endExclusive) {
+			return ex.Newf("version %q must use valid semantic versions", versionRange)
+		}
+		if semver.Compare(startInclusive, endExclusive) >= 0 {
+			return ex.Newf("version %q must have a lower bound below the upper bound", versionRange)
+		}
+		return nil
+	}
+
+	if !semver.IsValid(versionRange) {
+		return ex.Newf("version %q must be a valid semantic version", versionRange)
+	}
+
+	return nil
+}
+
+// VersionInRange checks if a given version is within a specified version range.
+// The version range can be in one of the following formats:
+// - "" (empty string): means all versions are supported.
+// - "v0.11.0": means all versions >= v0.11.0 are supported.
+// - "v0.11.0,v0.12.0": means versions >= v0.11.0 and < v0.12.0 are supported.
+func VersionInRange(version, versionRange string) bool {
+	// No version specified, so it's always applicable
+	if versionRange == "" {
+		return true
+	}
+
+	// Version range? i.e. "v0.11.0,v0.12.0"
+	if startInclusive, endExclusive, ok := strings.Cut(versionRange, ","); ok {
+		return semver.Compare(version, startInclusive) >= 0 &&
+			semver.Compare(version, endExclusive) < 0
+	}
+
+	// Minimal version only? i.e. "v0.11.0"
+	return semver.Compare(version, versionRange) >= 0
+}
